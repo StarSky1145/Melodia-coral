@@ -40,8 +40,7 @@ private const val COOKIE_POLL_MS = 800L
 private const val HOST_URL = "https://${NeteaseEndpoints.WEB_HOST}"
 
 // 这些后缀的资源一律不下载（图片/字体/音视频），登录页靠 JS 渲染，不影响功能
-private val BLOCK_EXT = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico",
-    ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".m4a")
+private val BLOCK_EXT = listOf(".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".m4a")
 
 // 与 WebViewLoginScreen 一致的净化 UA：页面本身会按 UA 走移动端分支
 private const val WEB_UA =
@@ -139,7 +138,7 @@ private const val DRIVER_JS = """
       return;
     }
     if (phoneEl.value !== PHONE) setValue(phoneEl, PHONE);
-    var sendBtn = byText(/(获取验证码|发送验证码|点击获取|重新获取)/);
+    var sendBtn = byText(/(获取验证码|发送验证码|点击获取|重新获取|重新发送)/);
     if (!sendBtn) { retry(); return; }
     sendBtn.click();
     report("progress", "已点击获取验证码");
@@ -173,9 +172,9 @@ private const val WATCHER_JS = """
       return;
     }
     if (sawVerify) { done("verifygone", ""); return; }
-    var sent = byText(/(重新获取|重发|已发送|\d+\s*[sS]\s*后)/);
+    var sent = byText(/(重新发送|重新获取|重发|已发送|\d+\s*[sS]\s*[)）])/);
     if (sent) { done("sent", (sent.innerText || "").trim()); return; }
-    var err = byText(/(发送失败|操作频繁|请稍后|验证失败)/);
+    var err = byText(/(发送失败|操作频繁|请稍后|验证失败|验证出错|验证码错误)/);
     if (err) { done("fail", (err.innerText || "").trim()); return; }
     // 发码流程里验证通过后页面会自己发，继续等；别的流程由 Kotlin 侧超时兜底
     if (checks < 240) setTimeout(tick, 500);
@@ -394,10 +393,11 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             lp.width = metrics.widthPixels
             lp.height = metrics.heightPixels
             lp.gravity = Gravity.TOP or Gravity.START
-            // 双保险：整块透明 + 移出屏幕，用户看不到也不会抢触摸
-            lp.x = metrics.widthPixels
-            lp.y = metrics.heightPixels
-            lp.alpha = 0f
+            // 屏幕外或 alpha=0 的窗口 WebView 可能被判定不可见、停止布局，
+            // 所以留在原位、用 1% 透明度（人眼看不出），保证页面真的在正常渲染
+            lp.x = 0
+            lp.y = 0
+            lp.alpha = 0.01f
             w.attributes = lp
         }
         runCatching { d.show() }.onFailure {
@@ -450,9 +450,9 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
         lp.width = metrics.widthPixels
         lp.height = metrics.heightPixels
         lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = metrics.widthPixels
-        lp.y = metrics.heightPixels
-        lp.alpha = 0f
+        lp.x = 0
+        lp.y = 0
+        lp.alpha = 0.01f
         w.attributes = lp
         w.setDimAmount(0f)
         w.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
