@@ -170,8 +170,9 @@ class LoginViewModel(
         return true
     }
 
-    // 发送登录验证码；倒计时未结束或正在发送时忽略重复点击
-    fun sendSmsCode(phone: String, countryCode: String = "86") {
+    // 发送登录验证码；倒计时未结束或正在发送时忽略重复点击。
+    // webDriver 不为空时由隐藏的网页登录页真正发码（绕风控），否则退回 weapi 直连
+    fun sendSmsCode(phone: String, countryCode: String = "86", webDriver: SmsWebDriver? = null) {
         val current = _smsState.value
         if (current.sending || current.resendCountdown > 0) return
         val normalized = normalizePhone(phone)
@@ -180,6 +181,20 @@ class LoginViewModel(
             return
         }
         _smsState.update { it.copy(sending = true, error = null) }
+        if (webDriver != null) {
+            // 回调约定在主线程，直接改状态即可
+            webDriver.sendCode(normalized) { result ->
+                if (result.isSuccess) {
+                    _smsState.update { it.copy(sending = false, sentTo = normalized) }
+                    startCountdown()
+                } else {
+                    _smsState.update {
+                        it.copy(sending = false, error = smsErrorText(result.exceptionOrNull(), "验证码发送失败，请稍后重试"))
+                    }
+                }
+            }
+            return
+        }
         viewModelScope.launch {
             val result = authRepository.sendCaptcha(normalized, countryCode).first()
             if (result.isSuccess) {
@@ -193,8 +208,15 @@ class LoginViewModel(
         }
     }
 
-    // 手机号 + 验证码登录，成功后把 Cookie 交给调用方落盘
-    fun loginWithSms(phone: String, code: String, onLoginSuccess: (String) -> Unit, countryCode: String = "86") {
+    // 手机号 + 验证码登录，成功后把 Cookie 交给调用方落盘。
+    // webDriver 不为空时由隐藏的网页登录页提交登录
+    fun loginWithSms(
+        phone: String,
+        code: String,
+        onLoginSuccess: (String) -> Unit,
+        countryCode: String = "86",
+        webDriver: SmsWebDriver? = null
+    ) {
         if (_smsState.value.loggingIn) return
         val normalized = normalizePhone(phone)
         val trimmedCode = code.trim()
@@ -208,6 +230,20 @@ class LoginViewModel(
             return
         }
         _smsState.update { it.copy(loggingIn = true, error = null) }
+        if (webDriver != null) {
+            webDriver.login(normalized, trimmedCode) { result ->
+                val cookies = result.getOrNull()
+                if (!cookies.isNullOrEmpty()) {
+                    _smsState.update { it.copy(loggingIn = false) }
+                    onLoginSuccess(cookies)
+                } else {
+                    _smsState.update {
+                        it.copy(loggingIn = false, error = smsErrorText(result.exceptionOrNull(), "登录失败，请重试"))
+                    }
+                }
+            }
+            return
+        }
         viewModelScope.launch {
             val result = authRepository.loginWithCaptcha(normalized, trimmedCode, countryCode).first()
             val cookies = result.getOrNull()

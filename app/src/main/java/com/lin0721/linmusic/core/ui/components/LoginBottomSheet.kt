@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -47,9 +48,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.zxing.common.BitMatrix
+import com.lin0721.linmusic.core.auth.AndroidSmsWebDriver
 import com.lin0721.linmusic.core.auth.LoginViewModel
 import com.lin0721.linmusic.core.auth.QrLoginState
 import com.lin0721.linmusic.core.auth.SmsLoginState
+import com.lin0721.linmusic.core.auth.SmsWebDriver
 import com.lin0721.linmusic.core.ui.theme.BottomSheetShape
 import com.lin0721.linmusic.core.ui.theme.ContentSwitchDurationMs
 import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
@@ -96,9 +99,18 @@ fun LoginBottomSheet(
     val viewModel: LoginViewModel = koinViewModel()
     var mode by remember { mutableStateOf(LoginMode.PHONE) }
 
+    // 手机号登录改由隐藏的网页登录页真实发起（纯接口请求容易被风控拦掉）。
+    // 驱动跟着弹窗生命周期存活：发码和登录必须是同一个页面会话，所以不能中途释放
+    val context = LocalContext.current
+    val smsDriver = remember { AndroidSmsWebDriver(context) }
+    val smsWebDriver: SmsWebDriver? = remember(smsDriver) { if (smsDriver.available) smsDriver else null }
+
     // 弹窗整体离开组合时兜底停止轮询，覆盖点击遮罩/手势关闭等未经返回按钮的路径
     DisposableEffect(Unit) {
-        onDispose { viewModel.resetQrState() }
+        onDispose {
+            viewModel.resetQrState()
+            smsDriver.release()
+        }
     }
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -167,6 +179,7 @@ fun LoginBottomSheet(
                     when (targetMode) {
                         LoginMode.PHONE -> PhoneLoginContent(
                             viewModel = viewModel,
+                            webDriver = smsWebDriver,
                             onLoginSuccess = onLoginSuccess,
                             onOtherMethods = { mode = LoginMode.CHOICE }
                         )
@@ -195,6 +208,7 @@ fun LoginBottomSheet(
 @Composable
 private fun PhoneLoginContent(
     viewModel: LoginViewModel,
+    webDriver: SmsWebDriver?,
     onLoginSuccess: (String) -> Unit,
     onOtherMethods: () -> Unit
 ) {
@@ -248,7 +262,9 @@ private fun PhoneLoginContent(
             keyboardType = KeyboardType.NumberPassword,
             imeAction = ImeAction.Done,
             letterSpacing = true,
-            trailing = { ResendButton(state = state, onClick = { viewModel.sendSmsCode(phone) }) }
+            trailing = {
+                ResendButton(state = state, onClick = { viewModel.sendSmsCode(phone, webDriver = webDriver) })
+            }
         )
 
         val hint = when {
@@ -264,7 +280,7 @@ private fun PhoneLoginContent(
         )
 
         MelodiaButton(
-            onClick = { viewModel.loginWithSms(phone, code, onLoginSuccess) },
+            onClick = { viewModel.loginWithSms(phone, code, onLoginSuccess, webDriver = webDriver) },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = MelodiaSpacing.md)
