@@ -1,0 +1,732 @@
+package com.lin0721.linmusic.core.player
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.media.AudioManager
+import android.os.Build
+import android.os.Bundle
+import androidx.annotation.OptIn
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
+import androidx.media.app.NotificationCompat as MediaNotificationCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters.AudioOffloadPreferences
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.session.CommandButton
+import androidx.media3.session.MediaNotification
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionCommands
+import androidx.media3.session.SessionResult
+import coil3.SingletonImageLoader
+import coil3.request.CachePolicy
+import coil3.request.ImageRequest
+import coil3.request.allowHardware
+import coil3.toBitmap
+import com.lin0721.linmusic.MainActivity
+import com.lin0721.linmusic.R
+import com.lin0721.linmusic.core.auth.UserPreferences
+import com.lin0721.linmusic.core.log.AppLogger
+import com.lin0721.linmusic.core.player.external.EXTRA_LYRIC_INFO
+import com.lin0721.linmusic.core.player.external.ExternalLyricCoordinator
+import com.lin0721.linmusic.core.preferences.SettingsPreferences
+import com.lin0721.linmusic.core.songlike.SongLikeRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import org.koin.android.ext.android.inject
+
+private const val TAG = "MelodiaPlaybackService"
+private const val NOTIFICATION_ID = 1001
+private const val PLAYBACK_CHANNEL_ID = "melodia_playback_channel"
+private const val PLAYBACK_CHANNEL_NAME = "正在播放"
+private const val ACTION_UNLOCK_FLOATING_LYRIC = "ACTION_UNLOCK_FLOATING_LYRIC"
+private const val ACTION_PREPARE_FOREGROUND = "com.lin0721.linmusic.action.PREPARE_FOREGROUND"
+private const val ACTION_STOP_PENDING_FOREGROUND = "com.lin0721.linmusic.action.STOP_PENDING_FOREGROUND"
+private const val EXTRA_PENDING_TITLE = "extra_pending_title"
+private const val EXTRA_PENDING_ARTIST = "extra_pending_artist"
+
+class MelodiaPlaybackService : MediaSessionService() {
+
+    companion object {
+        // 拉取在线播放链接前趁应用仍具前台资格先行提升前台服务，避免切后台后网络受限或 FGS 被拒
+        fun startForPendingPlay(context: Context, title: String, artist: String) {
+            val intent = Intent(context, MelodiaPlaybackService::class.java).apply {
+                action = ACTION_PREPARE_FOREGROUND
+                putExtra(EXTRA_PENDING_TITLE, title)
+                putExtra(EXTRA_PENDING_ARTIST, artist)
+            }
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "预启动播放前台服务失败", e)
+            }
+        }
+
+        // 待播拉链被取消或彻底失败且底层未在播放时，移除预启动的前台状态
+        fun stopPendingForeground(context: Context) {
+            val intent = Intent(context, MelodiaPlaybackService::class.java).apply {
+                action = ACTION_STOP_PENDING_FOREGROUND
+            }
+            runCatching { context.startService(intent) }
+        }
+    }
+
+    private val playerManager: PlayerManager by inject()
+    private val settingsPreferences: SettingsPreferences by inject()
+    private val userPreferences: UserPreferences by inject()
+    private val songLikeRepository: SongLikeRepository by inject()
+    private val externalLyricCoordinator: ExternalLyricCoordinator by inject()
+    private val externalInterruptionResumeController: ExternalInterruptionResumeController by inject()
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var isLikedListLoaded = false
+    private var isShowLockscreenEnabled = true
+    // 悬浮歌词开启且已锁定时，通知栏提供解锁按钮
+    private var isFloatingLyricLocked = false
+
+    private var player: Player? = null
+    private var crossfadePlayer: CrossfadePlayer? = null
+    private var mediaSession: MediaSession? = null
+    private var sessionActivityPendingIntent: PendingIntent? = null
+    private var currentCoverBitmap: Bitmap? = null
+    private var notificationCallback: MediaNotification.Provider.Callback? = null
+
+    private fun ensureNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            if (manager?.getNotificationChannel(PLAYBACK_CHANNEL_ID) == null) {
+                val channel = NotificationChannel(
+                    PLAYBACK_CHANNEL_ID,
+                    PLAYBACK_CHANNEL_NAME,
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "控制正在播放的音乐"
+                    setShowBadge(false)
+                }
+                manager?.createNotificationChannel(channel)
+            }
+        }
+    }
+
+    private fun loadCoverBitmap(coverUri: android.net.Uri?) {
+        if (coverUri == null) {
+            currentCoverBitmap = null
+            return
+        }
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                val raw = coverUri.toString()
+                val dataModel: Any = if ((raw.startsWith("http://") || raw.startsWith("https://")) && !raw.contains('?')) {
+                    "$raw?param=300y300"
+                } else {
+                    coverUri
+                }
+                val request = ImageRequest.Builder(this@MelodiaPlaybackService)
+                    .data(dataModel)
+                    .size(256, 256)
+                    .memoryCachePolicy(CachePolicy.DISABLED)
+                    .allowHardware(false)
+                    .build()
+                val result = SingletonImageLoader.get(this@MelodiaPlaybackService).execute(request)
+                val bitmap = result.image?.toBitmap()
+                if (bitmap != null) {
+                    currentCoverBitmap = bitmap
+                    withContext(Dispatchers.Main) {
+                        updateMediaSessionButtons()
+                    }
+                }
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "加载通知栏封面失败", e)
+            }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    override fun onCreate() {
+        super.onCreate()
+        AppLogger.i(TAG, "Service onCreate instanceId=${System.identityHashCode(this)}")
+
+        ensureNotificationChannel()
+        setMediaNotificationProvider(MelodiaNotificationProvider())
+
+        serviceScope.launch {
+            songLikeRepository.likedSongIds.collect {
+                updateMediaSessionButtons()
+            }
+        }
+
+        serviceScope.launch {
+            settingsPreferences.showLockscreen.collect { enabled ->
+                isShowLockscreenEnabled = enabled
+            }
+        }
+
+        serviceScope.launch {
+            combine(settingsPreferences.showDesktopLrc, settingsPreferences.floatingLyricLocked) { shown, locked -> shown && locked }
+                .distinctUntilChanged()
+                .collect { locked ->
+                    isFloatingLyricLocked = locked
+                    updateMediaSessionButtons()
+                }
+        }
+
+        // 允许跨协议重定向（如 HTTPS 到 HTTP）
+        val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+        val defaultDataSourceFactory = DefaultDataSource.Factory(this, httpDataSourceFactory)
+
+        // 动态代理数据源，每次请求新数据源时获取最新配置并创建对应的源
+        val dynamicDataSourceFactory = androidx.media3.datasource.DataSource.Factory {
+            val isCacheEnabled = runBlocking {
+                settingsPreferences.streamCacheEnabled.first()
+            }
+            if (isCacheEnabled) {
+                val maxSize = runBlocking {
+                    settingsPreferences.audioCacheMaxSize.first()
+                }
+                val cache = AudioCacheManager.getCache(this@MelodiaPlaybackService, maxSize)
+                CacheDataSource.Factory()
+                    .setCache(cache)
+                    .setUpstreamDataSourceFactory(defaultDataSourceFactory)
+                    .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+                    .createDataSource()
+            } else {
+                defaultDataSourceFactory.createDataSource()
+            }
+        }
+
+        val mediaSourceFactory = DefaultMediaSourceFactory(dynamicDataSourceFactory)
+        val audioAttributes = AudioAttributes.Builder()
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setUsage(C.USAGE_MEDIA)
+            .build()
+        // 耳机拔出 / 蓝牙耳机断开（如收回耳机盒）时系统发出 AUDIO_BECOMING_NOISY，需自动暂停，避免外放；
+        // 两台都开启：交叉淡化期间淡出方和缓冲中的新歌也要一起停
+        val primaryPlayer = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+        val secondaryPlayer = ExoPlayer.Builder(this)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+        val sessionPlayer = CrossfadePlayer(
+            primary = primaryPlayer,
+            secondary = secondaryPlayer,
+            audioAttributes = audioAttributes
+        )
+        sessionPlayer.setMetadataTransformer { base ->
+            externalLyricCoordinator.applyToMediaMetadata(base.buildUpon(), base)
+        }
+        crossfadePlayer = sessionPlayer
+        playerManager.setPlaybackPositionSource(sessionPlayer::currentPositionSample)
+
+        serviceScope.launch {
+            settingsPreferences.playWithOtherApps.collect { playWithOtherApps ->
+                sessionPlayer.setHandleAudioFocus(!playWithOtherApps)
+            }
+        }
+        // 设置页已保证两者互斥，这里再兜底一次，避免淡化时两台播放器争用卸载通道
+        serviceScope.launch {
+            combine(settingsPreferences.audioOffload, settingsPreferences.crossfadeEnabled) { offload, crossfade ->
+                offload && !crossfade
+            }.distinctUntilChanged().collect { enabled ->
+                primaryPlayer.setAudioOffloadEnabled(enabled)
+                secondaryPlayer.setAudioOffloadEnabled(enabled)
+            }
+        }
+
+        player = sessionPlayer
+
+        // 点击通知时跳转回应用；REORDER_TO_FRONT 避免每次新建 Activity 实例导致重新加载
+        val sessionActivityIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            sessionActivityIntent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        sessionActivityPendingIntent = pendingIntent
+
+        mediaSession = MediaSession.Builder(this, sessionPlayer)
+            .setCallback(CustomSessionCallback())
+            .setSessionActivity(pendingIntent)
+            .build()
+
+        externalLyricCoordinator.onMetadataChanged = {
+            sessionPlayer.notifyMetadataChanged()
+        }
+
+        externalInterruptionResumeController.start(
+            scope = serviceScope,
+            onResumeRequested = {
+                playerManager.resume()
+                sessionPlayer.play()
+            }
+        )
+
+        // 监听歌曲切换以更新控制栏上的红心图标及通知封面状态，并监听焦点变化
+        sessionPlayer.addListener(object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                super.onIsPlayingChanged(isPlaying)
+                externalInterruptionResumeController.onIsPlayingChanged(isPlaying)
+            }
+
+            override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                super.onMediaItemTransition(mediaItem, reason)
+                externalInterruptionResumeController.onTrackTransition(mediaItem?.mediaId?.toLongOrNull())
+                loadCoverBitmap(mediaItem?.mediaMetadata?.artworkUri)
+                mediaItem?.mediaId?.toLongOrNull()?.let { songId ->
+                    checkAndFetchLikedStatus(songId)
+                } ?: updateMediaSessionButtons()
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                super.onPlayWhenReadyChanged(playWhenReady, reason)
+                if (!playWhenReady) {
+                    if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
+                        externalInterruptionResumeController.onAudioFocusLoss(
+                            playbackState = sessionPlayer.playbackState,
+                            currentSongId = sessionPlayer.currentMediaItem?.mediaId?.toLongOrNull()
+                        )
+                    } else {
+                        externalInterruptionResumeController.onExplicitUserPause()
+                    }
+                } else {
+                    externalInterruptionResumeController.onPlaybackStarted()
+                }
+            }
+        })
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_PREPARE_FOREGROUND -> {
+                val title = intent.getStringExtra(EXTRA_PENDING_TITLE)
+                val artist = intent.getStringExtra(EXTRA_PENDING_ARTIST)
+                promoteToForegroundForPendingPlay(title, artist)
+            }
+            ACTION_STOP_PENDING_FOREGROUND -> {
+                val currentPlayer = player
+                if (currentPlayer == null || (currentPlayer.playbackState == Player.STATE_IDLE && !currentPlayer.isPlaying)) {
+                    runCatching { ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE) }
+                }
+            }
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun promoteToForegroundForPendingPlay(pendingTitle: String?, pendingArtist: String?) {
+        ensureNotificationChannel()
+        val title = pendingTitle?.takeIf { it.isNotBlank() }
+            ?: player?.currentMediaItem?.mediaMetadata?.title?.toString()?.takeIf { it.isNotBlank() }
+            ?: getString(R.string.app_name)
+        val artist = pendingArtist?.takeIf { it.isNotBlank() }
+            ?: player?.currentMediaItem?.mediaMetadata?.artist?.toString().orEmpty()
+        val notification = buildPendingForegroundNotification(title, artist)
+        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        } else {
+            0
+        }
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "进入待播前台服务失败", e)
+        }
+    }
+
+    private fun buildPendingForegroundNotification(title: String, artist: String): Notification {
+        val builder = NotificationCompat.Builder(this, PLAYBACK_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle(title)
+            .setContentText(artist)
+            .setContentIntent(sessionActivityPendingIntent)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setShowWhen(false)
+        currentCoverBitmap?.let { builder.setLargeIcon(it) }
+        mediaSession?.let { session ->
+            val mediaStyle = MediaNotificationCompat.MediaStyle()
+                .setMediaSession(
+                    android.support.v4.media.session.MediaSessionCompat.Token.fromToken(
+                        session.platformToken
+                    )
+                )
+            builder.setStyle(mediaStyle)
+        }
+        return builder.build()
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? {
+        if (!isShowLockscreenEnabled) {
+            val allowedPackages = listOf(packageName, "com.android.bluetooth")
+            if (controllerInfo.packageName !in allowedPackages) {
+                return null
+            }
+        }
+        return mediaSession
+    }
+
+    override fun onDestroy() {
+        playerManager.setPlaybackPositionSource(null)
+        AppLogger.i(TAG, "Service onDestroy instanceId=${System.identityHashCode(this)}")
+        externalInterruptionResumeController.release()
+        externalLyricCoordinator.onMetadataChanged = null
+        externalLyricCoordinator.release()
+        playerManager.release()
+        playerManager.saveState()
+        serviceScope.cancel()
+        notificationCallback = null
+        currentCoverBitmap = null
+        mediaSession?.run {
+            release()
+            mediaSession = null
+        }
+        crossfadePlayer?.release()
+        crossfadePlayer = null
+        player = null
+        super.onDestroy()
+    }
+
+    private fun checkAndFetchLikedStatus(songId: Long) {
+        serviceScope.launch {
+            val profile = userPreferences.userProfile.first()
+            if (profile != null && !isLikedListLoaded) {
+                songLikeRepository.getLikedSongIds(profile.uid).collect { result ->
+                    result.onSuccess {
+                        isLikedListLoaded = true
+                    }.onFailure {
+                        AppLogger.w(TAG, "获取已喜欢歌曲列表失败，红心状态可能不同步", it)
+                    }
+                }
+            } else {
+                updateMediaSessionButtons()
+            }
+        }
+    }
+
+    private fun toggleLike(songId: Long) {
+        serviceScope.launch {
+            val isLiked = songId in songLikeRepository.likedSongIds.value
+            val targetLiked = !isLiked
+            songLikeRepository.likeSong(songId, targetLiked).collect { }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun buildLikeButton(): CommandButton {
+        val songId = player?.currentMediaItem?.mediaId?.toLongOrNull() ?: -1L
+        val isLiked = songId != -1L && songId in songLikeRepository.likedSongIds.value
+        val icon = if (isLiked) CommandButton.ICON_HEART_FILLED else CommandButton.ICON_HEART_UNFILLED
+        val displayName = if (isLiked) "取消喜欢" else "喜欢"
+
+        return CommandButton.Builder(icon)
+            .setSessionCommand(SessionCommand("ACTION_TOGGLE_LIKE", Bundle()))
+            .setDisplayName(displayName)
+            .setSlots(CommandButton.SLOT_BACK_SECONDARY, CommandButton.SLOT_OVERFLOW)
+            .build()
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun buildUnlockLyricButton(): CommandButton =
+        CommandButton.Builder(CommandButton.ICON_UNDEFINED)
+            .setCustomIconResId(R.drawable.ic_lock_open)
+            .setSessionCommand(SessionCommand(ACTION_UNLOCK_FLOATING_LYRIC, Bundle()))
+            .setDisplayName("解锁歌词")
+            .setSlots(CommandButton.SLOT_OVERFLOW)
+            .build()
+
+    // 解锁按钮随锁定状态增删，布局变化会让 Media3 重建通知
+    @OptIn(UnstableApi::class)
+    private fun buildCustomLayout(): List<CommandButton> {
+        return listOfNotNull(buildLikeButton(), buildUnlockLyricButton().takeIf { isFloatingLyricLocked })
+    }
+
+    // 不能在这里声明 SLOT_BACK / SLOT_FORWARD 的上/下一首按钮：Media3 一旦发现这两个槽位被占用，
+    // 会把标准的 ACTION_SKIP_TO_PREVIOUS / NEXT 从旧版 PlaybackState 里剔除，改以自定义动作下发。
+    // 一加(ColorOS/OxygenOS)的折叠态媒体卡片只认标准动作，上/下一首会显示成不可点，展开后才恢复。
+    // 省略后上/下一首由播放器可用命令自动映射为标准动作，所有系统界面都能识别。
+    @OptIn(UnstableApi::class)
+    private fun buildMediaButtonPreferences(): List<CommandButton> {
+        return listOf(buildLikeButton())
+    }
+
+    private fun buildAvailableSessionCommands(): SessionCommands {
+        return SessionCommands.Builder()
+            .add(SessionCommand("ACTION_TOGGLE_LIKE", Bundle()))
+            .add(SessionCommand("ACTION_TOGGLE_PLAY_MODE", Bundle()))
+            .add(SessionCommand("ACTION_SET_PREFERRED_AUDIO_DEVICE", Bundle()))
+            .add(SessionCommand(ACTION_UNLOCK_FLOATING_LYRIC, Bundle()))
+            .build()
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun updateMediaSessionButtons() {
+        val session = mediaSession ?: return
+        val customLayout = buildCustomLayout()
+        val mediaButtonPreferences = buildMediaButtonPreferences()
+        val sessionCommands = buildAvailableSessionCommands()
+
+        session.setCustomLayout(customLayout)
+        session.setMediaButtonPreferences(mediaButtonPreferences)
+        for (controller in session.connectedControllers) {
+            session.setAvailableCommands(
+                controller,
+                sessionCommands,
+                MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS
+            )
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private inner class CustomSessionCallback : MediaSession.Callback {
+        @OptIn(UnstableApi::class)
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo
+        ): MediaSession.ConnectionResult {
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(buildAvailableSessionCommands())
+                .setAvailablePlayerCommands(MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS)
+                .setCustomLayout(buildCustomLayout())
+                .setMediaButtonPreferences(buildMediaButtonPreferences())
+                .setSessionActivity(sessionActivityPendingIntent)
+                .build()
+        }
+
+        override fun onPostConnect(session: MediaSession, controller: MediaSession.ControllerInfo) {
+            super.onPostConnect(session, controller)
+            updateMediaSessionButtons()
+        }
+
+        override fun onPlayerCommandRequest(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            playerCommand: Int
+        ): Int {
+            when (playerCommand) {
+                Player.COMMAND_SEEK_TO_NEXT,
+                Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> {
+                    externalInterruptionResumeController.onTrackTransition(null)
+                    playerManager.playNext()
+                    return SessionResult.RESULT_SUCCESS
+                }
+                Player.COMMAND_SEEK_TO_PREVIOUS,
+                Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM -> {
+                    externalInterruptionResumeController.onTrackTransition(null)
+                    playerManager.playPrevious()
+                    return SessionResult.RESULT_SUCCESS
+                }
+                Player.COMMAND_PLAY_PAUSE -> {
+                    if (externalInterruptionResumeController.isAwaitingResumeActive() && player?.playWhenReady == false) {
+                        externalInterruptionResumeController.onExplicitUserPause()
+                    }
+                }
+                Player.COMMAND_STOP -> {
+                    externalInterruptionResumeController.onExplicitUserPause()
+                }
+            }
+            return super.onPlayerCommandRequest(session, controller, playerCommand)
+        }
+
+        @OptIn(UnstableApi::class)
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle
+        ): com.google.common.util.concurrent.ListenableFuture<SessionResult> {
+            when (customCommand.customAction) {
+                "ACTION_TOGGLE_LIKE" -> {
+                    val songId = player?.currentMediaItem?.mediaId?.toLongOrNull() ?: -1L
+                    if (songId != -1L) {
+                        toggleLike(songId)
+                    }
+                    return com.google.common.util.concurrent.Futures.immediateFuture(
+                        SessionResult(SessionResult.RESULT_SUCCESS)
+                    )
+                }
+                ACTION_UNLOCK_FLOATING_LYRIC -> {
+                    serviceScope.launch { settingsPreferences.saveFloatingLyricLocked(false) }
+                    return com.google.common.util.concurrent.Futures.immediateFuture(
+                        SessionResult(SessionResult.RESULT_SUCCESS)
+                    )
+                }
+                "ACTION_TOGGLE_PLAY_MODE" -> {
+                    playerManager.rotatePlayMode()
+                    updateMediaSessionButtons()
+                    return com.google.common.util.concurrent.Futures.immediateFuture(
+                        SessionResult(SessionResult.RESULT_SUCCESS)
+                    )
+                }
+                "ACTION_SET_PREFERRED_AUDIO_DEVICE" -> {
+                    val deviceId = args.getInt("device_id", -1)
+                    val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+                    val targetDevice = if (deviceId == -1) {
+                        null
+                    } else {
+                        audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                            .firstOrNull { it.id == deviceId }
+                    }
+                    crossfadePlayer?.setPreferredAudioDevice(targetDevice)
+                    return com.google.common.util.concurrent.Futures.immediateFuture(
+                        SessionResult(SessionResult.RESULT_SUCCESS)
+                    )
+                }
+            }
+            return super.onCustomCommand(session, controller, customCommand, args)
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private inner class MelodiaNotificationProvider : MediaNotification.Provider {
+        override fun createNotification(
+            session: MediaSession,
+            customLayout: com.google.common.collect.ImmutableList<CommandButton>,
+            actionFactory: MediaNotification.ActionFactory,
+            onNotificationChangedCallback: MediaNotification.Provider.Callback
+        ): MediaNotification {
+            notificationCallback = onNotificationChangedCallback
+            ensureNotificationChannel()
+
+            val currentItem = session.player.currentMediaItem
+            val metadata = currentItem?.mediaMetadata
+            val title = metadata?.title?.toString()?.ifBlank { null } ?: getString(R.string.app_name)
+            val artist = metadata?.artist?.toString() ?: ""
+
+            val isPlaying = session.player.isPlaying
+            val playPauseIconRes = if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
+            val playPauseTitle = if (isPlaying) "暂停" else "播放"
+
+            val prevAction = actionFactory.createMediaAction(
+                session,
+                IconCompat.createWithResource(this@MelodiaPlaybackService, android.R.drawable.ic_media_previous),
+                "上一首",
+                Player.COMMAND_SEEK_TO_PREVIOUS
+            )
+            val playPauseAction = actionFactory.createMediaAction(
+                session,
+                IconCompat.createWithResource(this@MelodiaPlaybackService, playPauseIconRes),
+                playPauseTitle,
+                Player.COMMAND_PLAY_PAUSE
+            )
+            val nextAction = actionFactory.createMediaAction(
+                session,
+                IconCompat.createWithResource(this@MelodiaPlaybackService, android.R.drawable.ic_media_next),
+                "下一首",
+                Player.COMMAND_SEEK_TO_NEXT
+            )
+
+            val songId = currentItem?.mediaId?.toLongOrNull() ?: -1L
+            val isLiked = songId != -1L && songId in songLikeRepository.likedSongIds.value
+            val likeIconRes = if (isLiked) R.drawable.ic_favorite else R.drawable.ic_favorite_border
+            val likeTitle = if (isLiked) "取消喜欢" else "喜欢"
+            val likeAction = actionFactory.createCustomAction(
+                session,
+                IconCompat.createWithResource(this@MelodiaPlaybackService, likeIconRes),
+                likeTitle,
+                "ACTION_TOGGLE_LIKE",
+                Bundle.EMPTY
+            )
+
+            val builder = NotificationCompat.Builder(this@MelodiaPlaybackService, PLAYBACK_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(title)
+                .setContentText(artist)
+                .setContentIntent(sessionActivityPendingIntent)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setOnlyAlertOnce(true)
+                .setOngoing(isPlaying)
+                .setShowWhen(false)
+                .addAction(prevAction)
+                .addAction(playPauseAction)
+                .addAction(nextAction)
+                .addAction(likeAction)
+
+            if (isFloatingLyricLocked) {
+                builder.addAction(
+                    actionFactory.createCustomAction(
+                        session,
+                        IconCompat.createWithResource(this@MelodiaPlaybackService, R.drawable.ic_lock_open),
+                        "解锁歌词",
+                        ACTION_UNLOCK_FLOATING_LYRIC,
+                        Bundle.EMPTY
+                    )
+                )
+            }
+
+            val lyricInfo = metadata?.extras?.getString(EXTRA_LYRIC_INFO)
+            if (!lyricInfo.isNullOrBlank()) {
+                builder.addExtras(Bundle().apply { putString(EXTRA_LYRIC_INFO, lyricInfo) })
+            }
+
+            currentCoverBitmap?.let { bitmap ->
+                builder.setLargeIcon(bitmap)
+            }
+
+            val mediaStyle = MediaNotificationCompat.MediaStyle()
+                .setShowActionsInCompactView(0, 1, 2)
+                .setMediaSession(
+                    android.support.v4.media.session.MediaSessionCompat.Token.fromToken(
+                        session.platformToken
+                    )
+                )
+            builder.setStyle(mediaStyle)
+
+            return MediaNotification(NOTIFICATION_ID, builder.build())
+        }
+
+        override fun handleCustomCommand(
+            session: MediaSession,
+            action: String,
+            extras: Bundle
+        ): Boolean = false
+
+        override fun getNotificationChannelInfo(): MediaNotification.Provider.NotificationChannelInfo =
+            MediaNotification.Provider.NotificationChannelInfo(PLAYBACK_CHANNEL_ID, PLAYBACK_CHANNEL_NAME)
+    }
+}
+
+// 音频卸载交给 DSP 解码；格式或设备不支持时 ExoPlayer 自动回退软件解码，播放中切换会重配音频输出
+@OptIn(UnstableApi::class)
+private fun ExoPlayer.setAudioOffloadEnabled(enabled: Boolean) {
+    val mode = if (enabled) {
+        AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
+    } else {
+        AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED
+    }
+    trackSelectionParameters = trackSelectionParameters.buildUpon()
+        .setAudioOffloadPreferences(AudioOffloadPreferences.Builder().setAudioOffloadMode(mode).build())
+        .build()
+}
+
+
+

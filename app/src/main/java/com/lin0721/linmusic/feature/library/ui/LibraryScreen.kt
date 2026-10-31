@@ -1,0 +1,887 @@
+package com.lin0721.linmusic.feature.library.ui
+
+import androidx.compose.animation.*
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.TrendingUp
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.List
+import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.LibraryMusic
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.SwapVert
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil3.compose.AsyncImage
+import com.lin0721.linmusic.core.ui.components.MelodiaIconButton
+import com.lin0721.linmusic.core.ui.components.MelodiaButton
+import com.lin0721.linmusic.LocalBottomOverlayInset
+import com.lin0721.linmusic.LocalGlobalOverlayOpen
+import com.lin0721.linmusic.core.ui.components.LoginBottomSheet
+import com.lin0721.linmusic.core.ui.components.MelodiaDragHandle
+import com.lin0721.linmusic.core.ui.components.WebViewLoginScreen
+import com.lin0721.linmusic.core.ui.interaction.pressable
+import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
+import com.lin0721.linmusic.core.ui.theme.MelodiaPress
+import com.lin0721.linmusic.core.ui.theme.BottomSheetShape
+import com.lin0721.linmusic.core.ui.theme.MelodiaSpacing
+import com.lin0721.linmusic.core.ui.theme.PillRadius
+import com.lin0721.linmusic.core.ui.theme.ScreenSlideDurationMs
+import com.lin0721.linmusic.core.ui.theme.rememberMelodiaGridColumns
+import com.lin0721.linmusic.core.ui.theme.uiTween
+import org.koin.androidx.compose.koinViewModel
+import androidx.compose.foundation.gestures.*
+import androidx.compose.animation.core.*
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.zIndex
+import java.util.Collections
+import kotlin.math.max
+import kotlin.math.min
+import android.content.Intent
+import com.lin0721.linmusic.core.ui.components.ProfileSidebar
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import com.lin0721.linmusic.core.auth.UserProfile
+import com.lin0721.linmusic.core.ui.theme.styledCorners
+import com.lin0721.linmusic.core.ui.theme.IsDarkStyle
+
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+@Composable
+fun LibraryScreen(
+    onPlaylistClick: (Long) -> Unit,
+    onArtistClick: (Long) -> Unit,
+    onAlbumClick: (Long) -> Unit,
+    onBack: () -> Unit,
+    onOpenSidebar: () -> Unit = {},
+    onLoginScreenVisibilityChanged: (Boolean) -> Unit = {},
+    onNavigateToLocalMusic: () -> Unit = {}
+) {
+    val motion = LocalUiMotion.current
+    val viewModel: LibraryViewModel = koinViewModel()
+    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val userProfile by viewModel.userProfile.collectAsStateWithLifecycle()
+    val selectedFilter by viewModel.selectedFilter.collectAsStateWithLifecycle()
+    val selectedPlaylistOwnerFilter by viewModel.selectedPlaylistOwnerFilter.collectAsStateWithLifecycle()
+    val sortOrder by viewModel.sortOrder.collectAsStateWithLifecycle()
+    val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
+    val isGridView by viewModel.isGridView.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    var showLoginSheet by remember { mutableStateOf(false) }
+    var showWebViewLogin by remember { mutableStateOf(false) }
+
+    // 监听网页登录界面可见性
+    LaunchedEffect(showWebViewLogin) {
+        onLoginScreenVisibilityChanged(showWebViewLogin)
+    }
+
+    LaunchedEffect(viewModel) {
+        viewModel.toastEvent.collect { message ->
+            com.lin0721.linmusic.core.ui.components.ToastManager.showToast(message)
+        }
+    }
+
+    var showCreateDialog by remember { mutableStateOf(false) }
+    var isSearchActive by remember { mutableStateOf(false) }
+    var showSortMenu by remember { mutableStateOf(false) }
+
+    var activeOptionsItem by remember { mutableStateOf<LibraryItem?>(null) }
+    var downloadQualityTarget by remember { mutableStateOf<LibraryItem?>(null) }
+    var deletePlaylistTarget by remember { mutableStateOf<LibraryItem?>(null) }
+    var isReorderMode by remember { mutableStateOf(false) }
+    val reorderedPlaylists = remember { mutableStateListOf<LibraryItem>() }
+
+    // 全局浮层开着时让位，避免抢先吞掉本该用来关浮层的返回事件
+    BackHandler(enabled = isReorderMode && !LocalGlobalOverlayOpen.current) {
+        isReorderMode = false
+    }
+
+    fun shareItem(item: LibraryItem) {
+        val (typeLabel, path) = when (item.type) {
+            LibraryItemType.PLAYLIST -> "歌单" to "playlist"
+            LibraryItemType.ALBUM -> "专辑" to "album"
+            LibraryItemType.ARTIST -> "歌手" to "artist"
+        }
+        val shareText = "${item.title} https://music.163.com/$path?id=${item.id}"
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, shareText)
+        }
+        context.startActivity(Intent.createChooser(intent, "分享$typeLabel"))
+    }
+
+    val scope = rememberCoroutineScope()
+
+    val onAvatarClick: () -> Unit = {
+        if (userProfile != null) {
+            onOpenSidebar()
+        } else {
+            showLoginSheet = true
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        AnimatedContent(
+            targetState = isReorderMode,
+            transitionSpec = {
+                val forward = targetState
+                val offsetY = 40
+                if (forward) {
+                    (fadeIn(motion.tween(300, delayMillis = 100, easing = FastOutSlowInEasing))
+                            + slideInVertically(motion.tween(300, delayMillis = 100, easing = FastOutSlowInEasing)) { offsetY })
+                        .togetherWith(
+                            fadeOut(motion.tween(200, easing = FastOutSlowInEasing))
+                                    + slideOutVertically(motion.tween(200, easing = FastOutSlowInEasing)) { -offsetY }
+                        )
+                } else {
+                    (fadeIn(motion.tween(300, delayMillis = 100, easing = FastOutSlowInEasing))
+                            + slideInVertically(motion.tween(300, delayMillis = 100, easing = FastOutSlowInEasing)) { -offsetY })
+                        .togetherWith(
+                            fadeOut(motion.tween(200, easing = FastOutSlowInEasing))
+                                    + slideOutVertically(motion.tween(200, easing = FastOutSlowInEasing)) { offsetY }
+                        )
+                }.using(SizeTransform(clip = false))
+            },
+            label = "library_reorder_transition"
+        ) { reordering ->
+            if (reordering) {
+                LibraryReorderView(
+                    playlists = reorderedPlaylists,
+                    onCancel = { isReorderMode = false },
+                    onDone = {
+                        viewModel.savePlaylistOrder(reorderedPlaylists.toList())
+                        isReorderMode = false
+                    }
+                )
+            } else {
+                Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+            // 1. 顶部栏 (支持搜索展开)
+            AnimatedContent(
+                targetState = isSearchActive,
+                transitionSpec = {
+                    motion.transform(fadeIn() togetherWith fadeOut())
+                },
+                label = "top_bar_search"
+            ) { active ->
+                if (active) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(64.dp)
+                            .padding(horizontal = MelodiaSpacing.md),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        MelodiaIconButton(onClick = {
+                            isSearchActive = false
+                            viewModel.updateSearchQuery("")
+                        }) {
+                            Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "返回", tint = MaterialTheme.colorScheme.onSurface)
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .clip(RoundedCornerShape(PillRadius))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .padding(horizontal = MelodiaSpacing.md),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            if (searchQuery.isEmpty()) {
+                                Text("搜索您的收藏内容...", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
+                            }
+                            BasicTextField(
+                                value = searchQuery,
+                                onValueChange = { viewModel.updateSearchQuery(it) },
+                                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp),
+                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true
+                            )
+                        }
+
+                        if (searchQuery.isNotEmpty()) {
+                            MelodiaIconButton(onClick = { viewModel.updateSearchQuery("") }) {
+                                Icon(Icons.Default.Close, contentDescription = "清除", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(64.dp)
+                            .padding(horizontal = MelodiaSpacing.md),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // 用户头像
+                        val avatarUrl = userProfile?.avatarUrl
+                        if (avatarUrl != null) {
+                            AsyncImage(
+                                model = "$avatarUrl?param=100y100",
+                                contentDescription = "用户头像",
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .pressable(MelodiaPress.Icon) { onAvatarClick() }
+                                    .clip(CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .pressable(MelodiaPress.Icon) { onAvatarClick() }
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surface),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.LibraryMusic,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(12.dp))
+
+                        Text(
+                            text = "音乐库",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontSize = 22.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+
+                        MelodiaIconButton(onClick = { isSearchActive = true }) {
+                            Icon(Icons.Default.Search, contentDescription = "搜索", tint = MaterialTheme.colorScheme.onSurface)
+                        }
+
+                        MelodiaIconButton(onClick = {
+                            if (userProfile != null) {
+                                showCreateDialog = true
+                            } else {
+                                com.lin0721.linmusic.core.ui.components.ToastManager.showToast("请先登录以创建歌单！")
+                                showLoginSheet = true
+                            }
+                        }) {
+                            Icon(Icons.Default.Add, contentDescription = "创建歌单", tint = MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
+            }
+
+            val successState = uiState as? LibraryUiState.Success
+            // 2. 分类过滤器横向滚动列表（包含最右侧本地音乐入口）
+            LibraryFilterPillsRow(
+                selectedFilter = selectedFilter,
+                playlistCount = successState?.playlistCount ?: 0,
+                albumCount = successState?.albumCount ?: 0,
+                artistCount = successState?.artistCount ?: 0,
+                onSelect = { viewModel.toggleFilter(it) },
+                onClear = { viewModel.clearFilter() },
+                selectedPlaylistOwnerFilter = selectedPlaylistOwnerFilter,
+                onSelectPlaylistOwnerFilter = { viewModel.togglePlaylistOwnerFilter(it) },
+                showCategoryFilters = userProfile != null,
+                onLocalMusicClick = onNavigateToLocalMusic
+            )
+
+            // 用户登录状态条件渲染
+            if (userProfile == null) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    NotLoggedInView(
+                        onLoginClick = { showLoginSheet = true }
+                    )
+                }
+            } else {
+                // 3. 混合聚合列表容器
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    when (val state = uiState) {
+                        is LibraryUiState.Loading -> {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                            }
+                        }
+                        is LibraryUiState.Error -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize().padding(MelodiaSpacing.xl),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = state.message,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 14.sp,
+                                        textAlign = TextAlign.Center
+                                    )
+                                    Spacer(modifier = Modifier.height(MelodiaSpacing.md))
+                                    MelodiaButton(
+                                        onClick = { viewModel.loadLibraryData() },
+                                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                                    ) {
+                                        Text("重试", color = MaterialTheme.colorScheme.onPrimary)
+                                    }
+                                }
+                            }
+                        }
+                        is LibraryUiState.Success -> {
+                            if (state.filteredItems.isEmpty()) {
+                                Box(
+                                    modifier = Modifier.fillMaxSize().padding(MelodiaSpacing.xl),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = if (searchQuery.isNotEmpty()) "未找到相关收藏项" else "列表为空，快去添加吧！",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        fontSize = 14.sp,
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            } else if (isGridView) {
+                                val gridColumns = rememberMelodiaGridColumns(compact = 3, expandedPortrait = 5, expandedLandscape = 7)
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(bottom = LocalBottomOverlayInset.current + 16.dp, top = 8.dp, start = MelodiaSpacing.md, end = MelodiaSpacing.md)
+                                ) {
+                                    item(key = "library_sort_bar") {
+                                        LibrarySortAndFilterBar(
+                                            sortOrder = sortOrder,
+                                            isGridView = isGridView,
+                                            onSortClick = { showSortMenu = true },
+                                            onToggleGridView = { viewModel.updateGridView(!isGridView) },
+                                            modifier = Modifier.padding(bottom = MelodiaSpacing.sm)
+                                        )
+                                    }
+                                    val rows = state.filteredItems.chunked(gridColumns)
+                                    items(rows, key = { row -> row.joinToString(separator = "_") { it.id } }) { row ->
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                        ) {
+                                            row.forEach { item ->
+                                                LibraryGridItem(
+                                                    item = item,
+                                                    modifier = Modifier.weight(1f),
+                                                    onClick = {
+                                                        if (item.type == LibraryItemType.PLAYLIST) {
+                                                            onPlaylistClick(item.id.toLong())
+                                                        } else if (item.type == LibraryItemType.ARTIST) {
+                                                            onArtistClick(item.id.toLong())
+                                                        } else {
+                                                            onAlbumClick(item.id.toLong())
+                                                        }
+                                                    },
+                                                    onLongClick = {
+                                                        if (item.id != "-2") {
+                                                            activeOptionsItem = item
+                                                        }
+                                                    }
+                                                )
+                                            }
+                                            repeat(gridColumns - row.size) {
+                                                Spacer(modifier = Modifier.weight(1f))
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.height(12.dp))
+                                    }
+                                }
+                            } else {
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(bottom = LocalBottomOverlayInset.current + 16.dp, top = 8.dp)
+                                ) {
+                                    item(key = "library_sort_bar") {
+                                        LibrarySortAndFilterBar(
+                                            sortOrder = sortOrder,
+                                            isGridView = isGridView,
+                                            onSortClick = { showSortMenu = true },
+                                            onToggleGridView = { viewModel.updateGridView(!isGridView) },
+                                            modifier = Modifier.padding(start = MelodiaSpacing.md, end = MelodiaSpacing.md, bottom = MelodiaSpacing.sm)
+                                        )
+                                    }
+                                    items(state.filteredItems, key = { "${it.type}_${it.id}" }) { item ->
+                                        LibraryItemRow(
+                                            item = item,
+                                            onClick = {
+                                                if (item.type == LibraryItemType.PLAYLIST) {
+                                                    onPlaylistClick(item.id.toLong())
+                                                } else if (item.type == LibraryItemType.ARTIST) {
+                                                    onArtistClick(item.id.toLong())
+                                                } else {
+                                                    onAlbumClick(item.id.toLong())
+                                                }
+                                            },
+                                            onLongClick = {
+                                                if (item.id != "-2") {
+                                                    activeOptionsItem = item
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 吸顶边缘纯黑弥散阴影
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(8.dp)
+                            .align(Alignment.TopCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = if (IsDarkStyle) listOf(
+                                        Color.Black.copy(alpha = 0.85f),
+                                        Color.Black.copy(alpha = 0.35f),
+                                        Color.Transparent
+                                    ) else listOf(
+                                        Color.Black.copy(alpha = 0.08f),
+                                        Color.Black.copy(alpha = 0.03f),
+                                        Color.Transparent
+                                    )
+                                )
+                            )
+                    )
+                }
+            }
+        }
+    }
+}
+
+        // 创建歌单对话框
+        if (showCreateDialog) {
+            LibraryCreatePlaylistSheet(
+                onDismiss = { showCreateDialog = false },
+                onCreate = { name ->
+                    viewModel.createPlaylist(name)
+                    showCreateDialog = false
+                }
+            )
+        }
+
+        // 登录管理底部面板与 WebView
+        if (showLoginSheet) {
+            LoginBottomSheet(
+                onDismiss = { showLoginSheet = false },
+                onWebLogin = {
+                    showLoginSheet = false
+                    showWebViewLogin = true
+                },
+                onLoginSuccess = { cookies ->
+                    showLoginSheet = false
+                    viewModel.handleLoginSuccess(cookies)
+                }
+            )
+        }
+
+        AnimatedVisibility(
+            visible = showWebViewLogin,
+            enter = slideInVertically(uiTween(ScreenSlideDurationMs)) { it } + fadeIn(uiTween(ScreenSlideDurationMs)),
+            exit = slideOutVertically(uiTween(ScreenSlideDurationMs)) { it } + fadeOut(uiTween(ScreenSlideDurationMs))
+        ) {
+            WebViewLoginScreen(
+                onClose = { showWebViewLogin = false },
+                onLoginSuccess = { cookies ->
+                    showWebViewLogin = false
+                    viewModel.handleLoginSuccess(cookies)
+                }
+            )
+        }
+
+        if (showSortMenu) {
+            LibrarySortMenuSheet(
+                currentSortOrder = sortOrder,
+                onSelect = { order ->
+                    viewModel.updateSortOrder(order)
+                    showSortMenu = false
+                },
+                onDismiss = { showSortMenu = false }
+            )
+        }
+
+        // 快速编辑底部弹层
+        if (activeOptionsItem != null) {
+            LibraryItemOptionsSheet(
+                item = activeOptionsItem!!,
+                onDismiss = { activeOptionsItem = null },
+                onTogglePin = { viewModel.togglePin(it) },
+                onEditOrder = {
+                    reorderedPlaylists.clear()
+                    reorderedPlaylists.addAll(viewModel.getPlaylistsForReorder())
+                    isReorderMode = true
+                },
+                onShare = { shareItem(it) },
+                onDownload = { item ->
+                    activeOptionsItem = null
+                    downloadQualityTarget = item
+                },
+                onDeletePlaylist = { playlistId ->
+                    val target = (uiState as? LibraryUiState.Success)?.allItems?.find { it.id == playlistId.toString() }
+                    if (target != null) {
+                        deletePlaylistTarget = target
+                    }
+                },
+                onUnsubscribePlaylist = { playlistId ->
+                    viewModel.unsubscribePlaylist(playlistId)
+                },
+                onUnsubscribeAlbum = { albumId ->
+                    viewModel.unsubscribeAlbum(albumId)
+                },
+                onUnsubscribeArtist = { artistId ->
+                    viewModel.unsubscribeArtist(artistId)
+                }
+            )
+        }
+
+        // 批量下载音质选择
+        if (downloadQualityTarget != null) {
+            val target = downloadQualityTarget!!
+            com.lin0721.linmusic.core.download.ui.DownloadQualityPickerSheet(
+                onQualitySelected = { level ->
+                    viewModel.downloadLibraryItem(target, level)
+                    downloadQualityTarget = null
+                },
+                onDismiss = { downloadQualityTarget = null },
+                headline = target.title,
+                supportingText = target.trackCount.takeIf { it > 0 }?.let { "共 $it 首" }
+            )
+        }
+
+        // 删除自建歌单二次确认对话框
+        if (deletePlaylistTarget != null) {
+            val target = deletePlaylistTarget!!
+            AlertDialog(
+                onDismissRequest = { deletePlaylistTarget = null },
+                title = { Text("删除歌单", fontWeight = FontWeight.Bold) },
+                text = { Text("确定要删除歌单「${target.title}」吗？删除后不可恢复。") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            target.id.toLongOrNull()?.let { viewModel.deletePlaylist(it) }
+                            deletePlaylistTarget = null
+                        }
+                    ) {
+                        Text("删除", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { deletePlaylistTarget = null }) {
+                        Text("取消")
+                    }
+                }
+            )
+        }
+    }
+}
+
+// 歌单拖拽重排视图
+@Composable
+private fun LibraryReorderView(
+    playlists: MutableList<LibraryItem>,
+    onCancel: () -> Unit,
+    onDone: () -> Unit
+) {
+    val motion = LocalUiMotion.current
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+    val scope = rememberCoroutineScope()
+    val reorderListState = rememberLazyListState()
+
+    val fallbackItemHeightPx = with(density) { 76.dp.toPx() }
+    var itemHeightPx by remember { mutableFloatStateOf(fallbackItemHeightPx) }
+    LaunchedEffect(reorderListState) {
+        snapshotFlow { reorderListState.layoutInfo.visibleItemsInfo.firstOrNull()?.size ?: 0 }
+            .collect { if (it > 0) itemHeightPx = it.toFloat() }
+    }
+
+    val topEdgeThreshold = with(density) { 80.dp.toPx() }
+    val bottomEdgeThreshold = with(density) { 100.dp.toPx() }
+
+    var draggedIndex by remember { mutableIntStateOf(-1) }
+    var dragOffset by remember { mutableFloatStateOf(0f) }
+    val isDraggingActive = draggedIndex >= 0
+
+    var settlingIndex by remember { mutableIntStateOf(-1) }
+    val settleOffset = remember { Animatable(0f) }
+
+    fun maxComposedIndex(): Int =
+        reorderListState.layoutInfo.visibleItemsInfo.maxOfOrNull { it.index } ?: playlists.lastIndex
+    fun minComposedIndex(): Int =
+        reorderListState.layoutInfo.visibleItemsInfo.minOfOrNull { it.index } ?: 0
+
+    fun clampDragOffset(offset: Float): Float = when {
+        (draggedIndex <= 0 || draggedIndex <= minComposedIndex()) && offset < 0f -> max(offset, -itemHeightPx)
+        (draggedIndex >= playlists.lastIndex || draggedIndex >= maxComposedIndex()) && offset > 0f -> min(offset, itemHeightPx)
+        else -> offset
+    }
+
+    fun neutralizeAnchorShift(from: Int, to: Int) {
+        val anchor = reorderListState.firstVisibleItemIndex
+        if (from != anchor && to != anchor) return
+        reorderListState.requestScrollToItem(anchor, reorderListState.firstVisibleItemScrollOffset)
+    }
+
+    fun advanceSwaps() {
+        var swapped = false
+        while (dragOffset > itemHeightPx && draggedIndex < playlists.lastIndex && draggedIndex < maxComposedIndex()) {
+            neutralizeAnchorShift(draggedIndex, draggedIndex + 1)
+            Collections.swap(playlists, draggedIndex, draggedIndex + 1)
+            draggedIndex += 1
+            dragOffset = clampDragOffset(dragOffset - itemHeightPx)
+            swapped = true
+        }
+        while (dragOffset < -itemHeightPx && draggedIndex > 0 && draggedIndex > minComposedIndex()) {
+            neutralizeAnchorShift(draggedIndex, draggedIndex - 1)
+            Collections.swap(playlists, draggedIndex, draggedIndex - 1)
+            draggedIndex -= 1
+            dragOffset = clampDragOffset(dragOffset + itemHeightPx)
+            swapped = true
+        }
+        if (swapped) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+    }
+
+    // 拖拽边缘自动滚屏
+    LaunchedEffect(isDraggingActive) {
+        if (!isDraggingActive) return@LaunchedEffect
+        var lastFrameTimeNs = 0L
+        var edgeDurationMs = 0L
+        while (isActive && draggedIndex >= 0) {
+            val frameTimeNs = withFrameNanos { it }
+            if (lastFrameTimeNs == 0L) {
+                lastFrameTimeNs = frameTimeNs
+                continue
+            }
+            val deltaMs = ((frameTimeNs - lastFrameTimeNs) / 1_000_000L).coerceIn(1L, 32L)
+            lastFrameTimeNs = frameTimeNs
+
+            val layoutInfo = reorderListState.layoutInfo
+            val draggingItem = layoutInfo.visibleItemsInfo.firstOrNull { it.index == draggedIndex }
+            if (draggingItem == null) continue
+
+            val currentTop = draggingItem.offset + dragOffset
+            val currentBottom = currentTop + itemHeightPx
+            val viewportEnd = layoutInfo.viewportEndOffset.toFloat()
+
+            val isNearTop = currentTop < topEdgeThreshold && draggedIndex > 0
+            val isNearBottom = currentBottom > (viewportEnd - bottomEdgeThreshold) &&
+                draggedIndex < playlists.lastIndex
+
+            if (!isNearTop && !isNearBottom) {
+                edgeDurationMs = 0L
+                continue
+            }
+            edgeDurationMs += deltaMs
+
+            val timeMultiplier = 1f + (edgeDurationMs / 600f).coerceAtMost(2.5f)
+            val depthRatio = if (isNearTop) {
+                ((topEdgeThreshold - currentTop) / topEdgeThreshold).coerceIn(0f, 1f)
+            } else {
+                ((currentBottom - (viewportEnd - bottomEdgeThreshold)) / bottomEdgeThreshold).coerceIn(0f, 1f)
+            }
+            val speedPxPerSec = (depthRatio * 1000f + 300f) * timeMultiplier
+            val stepPx = speedPxPerSec * deltaMs / 1000f
+
+            val scrolled = reorderListState.scrollBy(if (isNearTop) -stepPx else stepPx)
+            dragOffset = clampDragOffset(dragOffset + scrolled)
+            advanceSwaps()
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp)
+                .padding(horizontal = MelodiaSpacing.md),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            MelodiaIconButton(onClick = onCancel) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                    contentDescription = "取消",
+                    tint = MaterialTheme.colorScheme.onSurface
+                )
+            }
+            Text(
+                text = "调整歌单顺序",
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = MelodiaSpacing.sm)
+            )
+            MelodiaButton(
+                onClick = onDone,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                shape = styledCorners(10.dp),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = "完成",
+                    color = MaterialTheme.colorScheme.onPrimary,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        LazyColumn(
+            state = reorderListState,
+            userScrollEnabled = !isDraggingActive,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = LocalBottomOverlayInset.current + 16.dp, top = MelodiaSpacing.xs)
+        ) {
+            itemsIndexed(
+                items = playlists,
+                key = { _, item -> item.id }
+            ) { idx, item ->
+                val isDragging = draggedIndex == idx
+                val isSettling = settlingIndex == idx
+                Box(
+                    modifier = if (isDragging || isSettling) Modifier.zIndex(1f) else if (LocalUiMotion.current.enabled) Modifier.animateItem() else Modifier
+                ) {
+                    DraggablePlaylistRow(
+                        item = item,
+                        isDragging = isDragging,
+                        dragOffsetY = when {
+                            isDragging -> dragOffset
+                            isSettling -> settleOffset.value
+                            else -> 0f
+                        },
+                        enabled = true,
+                        onDragStart = {
+                            if (draggedIndex < 0) {
+                                settlingIndex = -1
+                                draggedIndex = idx
+                                dragOffset = 0f
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            }
+                        },
+                        onDrag = { delta ->
+                            if (draggedIndex == idx) {
+                                dragOffset = clampDragOffset(dragOffset + delta)
+                                advanceSwaps()
+                            }
+                        },
+                        onDragEnd = {
+                            if (draggedIndex == idx) {
+                                val releasedOffset = dragOffset
+                                draggedIndex = -1
+                                dragOffset = 0f
+                                if (releasedOffset != 0f) {
+                                    settlingIndex = idx
+                                    scope.launch {
+                                        settleOffset.snapTo(releasedOffset)
+                                        settleOffset.animateTo(0f, motion.spring(stiffness = Spring.StiffnessMediumLow))
+                                        settlingIndex = -1
+                                    }
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibrarySortAndFilterBar(
+    sortOrder: LibrarySortOrder,
+    isGridView: Boolean,
+    onSortClick: () -> Unit,
+    onToggleGridView: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier.pressable(MelodiaPress.Pill) { onSortClick() },
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.SwapVert,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = when (sortOrder) {
+                    LibrarySortOrder.RECENTLY_PLAYED -> "最近播放"
+                    LibrarySortOrder.NAME -> "字母排序"
+                    LibrarySortOrder.CUSTOM -> "自定义"
+                },
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+
+        MelodiaIconButton(
+            onClick = onToggleGridView,
+            modifier = Modifier.size(32.dp)
+        ) {
+            Icon(
+                imageVector = if (isGridView) Icons.AutoMirrored.Rounded.List else Icons.Rounded.GridView,
+                contentDescription = "切换视图",
+                tint = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+    }
+}

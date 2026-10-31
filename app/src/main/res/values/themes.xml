@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- API 31+ 系统启动页默认取纯色 windowBackground 作为底色 -->
+    <style name="Theme.Melodia" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+
+    <!-- 仅供 com.canhub.cropper.CropImageActivity 使用：该 Activity 继承 AppCompatActivity，
+         要求宿主主题在 AppCompat 体系内，跟 Theme.Melodia 无关，不要挪作他用。
+         不能带 NoActionBar：裁剪确认是 ActionBar 上的菜单项，没有 ActionBar 就没有确认入口，
+         CropImageOptions 里那组 toolbar* 配色也一并失效 -->
+    <style name="Theme.Melodia.Cropper" parent="Theme.AppCompat.DayNight" />
+
+    <!-- 听歌识曲授权跳板：只弹系统授权框，自身不可见 -->
+    <style name="Theme.Melodia.Translucent" parent="android:Theme.Translucent.NoTitleBar">
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+</resources>

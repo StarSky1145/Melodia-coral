@@ -1,0 +1,66 @@
+# Gradle 缓存与构建目录
+.gradle/
+build/
+app/build/
+
+# Kotlin 编译器日志与缓存
+.kotlin/
+
+# NDK 构建产物
+.cxx/
+
+# IDE 配置文件
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+.vscode/
+*.code-workspace
+
+# 本地环境属性（含 SDK 路径与 release 签名材料，见 RELEASE_SIGNING.md）
+local.properties
+
+# 签名密钥文件
+*.keystore
+*.jks
+*.pepk
+*.b64
+
+# 编译生成的打包文件
+*.apk
+*.aab
+*.aar
+*.jar
+
+!gradle/wrapper/gradle-wrapper.jar
+
+# 性能分析与内存快照
+captures/
+*.hprof
+
+# 垃圾文件
+.DS_Store
+Thumbs.db
+
+# 临时日志文件
+*.log
+
+# Claude Code 的本地配置与子代理工作树
+.claude/settings.local.json
+.claude/worktrees/
+.superpowers/
+
+# 规划文档
+CLAUDE.md
+*_plan.md
+*_PLAN.md
+REFACTOR_ROADMAP.md
+RELEASE_SIGNING.md
+# Gradle updateDaemonJvm 在本地生成的后台进程 JDK 约束，不纳入版本管理
+gradle/gradle-daemon-jvm.properties
+
+# 桌面端播放引擎动态库，本地放置
+desktopApp/native/

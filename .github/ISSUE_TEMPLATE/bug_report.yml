@@ -1,0 +1,83 @@
+name: Bug 反馈
+description: 报告 Melodia（Android / Windows 桌面端）中遇到的问题或异常行为
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - Android 手机
+        - Android 平板
+        - Windows 桌面端
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 实际发生了什么，以及你期望的正常表现
+      placeholder: 例如：开启随机播放后歌曲反复重置，期望正常随机切歌
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开某个歌单并播放
+        2. 点击随机播放按钮
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: 应用版本
+      description: Android 在「设置 - 关于」中查看；桌面端以下载的安装包文件名为准
+      placeholder: 例如：2.0.0-beta.1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: 桌面端安装方式（Android 无需填写）
+      options:
+        - 不适用
+        - 安装版（setup.exe）
+        - 免安装版（zip）
+    validations:
+      required: false
+
+  - type: input
+    id: device
+    attributes:
+      label: 设备与系统版本
+      placeholder: 例如：Xiaomi 14 Pro / Android 14，或 Windows 11 23H2
+    validations:
+      required: true
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: 截图、录屏或日志
+      description: |
+        可直接拖拽或粘贴文件上传，日志文件建议打包为 .zip / .txt
+        - Android：「设置 - 关于 - 导出并分享日志」
+        - 桌面端：「设置 - 日志 - 打开目录」，即 `%APPDATA%\Melodia\logs`；遇到问题前可把日志级别调到「详细」再复现
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前请确认
+      options:
+        - label: 已搜索过现有 Issue，确认没有重复反馈
+          required: true

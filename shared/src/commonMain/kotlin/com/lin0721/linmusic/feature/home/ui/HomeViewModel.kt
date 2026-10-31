@@ -1,0 +1,478 @@
+package com.lin0721.linmusic.feature.home.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.lin0721.linmusic.core.auth.AuthRepository
+import com.lin0721.linmusic.core.auth.UserPreferences
+import com.lin0721.linmusic.core.auth.UserProfile
+import com.lin0721.linmusic.core.api.AccountInfoResponse
+import com.lin0721.linmusic.core.log.AppLogger
+import com.lin0721.linmusic.feature.home.data.DailySong
+import com.lin0721.linmusic.core.auth.SyncProfileAfterLoginUseCase
+import com.lin0721.linmusic.feature.home.data.HomeRepository
+import com.lin0721.linmusic.feature.recent.data.RecentRepository
+import com.lin0721.linmusic.feature.home.data.PersonalizedData
+import com.lin0721.linmusic.feature.home.domain.HomeCard
+import com.lin0721.linmusic.core.player.data.PlaybackRepository
+import com.lin0721.linmusic.feature.home.domain.ToplistInfo
+import com.lin0721.linmusic.core.network.AppString
+import com.lin0721.linmusic.core.network.OnlineStateProvider
+import com.lin0721.linmusic.core.network.ResourceProvider
+import com.lin0721.linmusic.core.network.toUserMessage
+import com.lin0721.linmusic.core.songlike.LoadLikedSongIdsUseCase
+import com.lin0721.linmusic.core.songlike.SongLikeRepository
+import com.lin0721.linmusic.core.ui.components.PlaylistCollectItem
+import com.lin0721.linmusic.core.ui.components.PlaylistCollectState
+import com.lin0721.linmusic.feature.playlist.domain.CollectionActionsDelegate
+import com.lin0721.linmusic.feature.playlist.domain.SongCollectDelegate
+import com.lin0721.linmusic.feature.podcast.ui.PodcastPlayerController
+import com.lin0721.linmusic.feature.podcast.ui.PodcastPlayerState
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import com.lin0721.linmusic.core.download.SongDownloader
+import com.lin0721.linmusic.core.playlistmutation.PlaylistMutationBus
+import com.lin0721.linmusic.core.userplaylist.UserPlaylistRepository
+import com.lin0721.linmusic.core.player.PlaybackController
+import com.lin0721.linmusic.core.player.QueueItem
+import com.lin0721.linmusic.feature.playlist.data.PlaylistRepository
+
+private const val TAG = "HomeViewModel"
+
+// 首页 ViewModel
+class HomeViewModel(
+    private val syncProfileAfterLoginUseCase: SyncProfileAfterLoginUseCase,
+    private val playbackRepository: PlaybackRepository,
+    private val homeRepository: HomeRepository,
+    private val recentRepository: RecentRepository,
+    val playerManager: PlaybackController,
+    private val userPreferences: UserPreferences,
+    private val authRepository: AuthRepository,
+    private val resourceProvider: ResourceProvider,
+    private val loadLikedSongIdsUseCase: LoadLikedSongIdsUseCase,
+    private val songLikeRepository: SongLikeRepository,
+    private val songCollectDelegate: SongCollectDelegate,
+    private val podcastPlayer: PodcastPlayerController,
+    private val playlistRepository: PlaylistRepository,
+    private val onlineState: OnlineStateProvider,
+    private val userPlaylistRepository: UserPlaylistRepository,
+    private val songDownloadManager: SongDownloader,
+    private val playlistMutationBus: PlaylistMutationBus
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow<HomeUiState>(HomeUiState.Loading)
+    val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
+
+    val userProfile: StateFlow<UserProfile?> = userPreferences.userProfile
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    private val _toastEvent = MutableSharedFlow<String>()
+    val toastEvent: SharedFlow<String> = _toastEvent.asSharedFlow()
+
+    private val _isRefreshing = MutableStateFlow(false)
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
+    // mini 栏"收藏到歌单"弹层，跟全屏播放页共用同一套 SongCollectDelegate 机制，各自持一份独立实例；
+    // 用 StateFlow 而不是普通 Set，mini 栏爱心图标要跟着这份数据变化重组
+    val likedSongIds: StateFlow<Set<Long>> = songLikeRepository.likedSongIds
+    val collectState: StateFlow<PlaylistCollectState> = songCollectDelegate.state
+
+    // 迷你条的播客订阅按钮，状态与全屏播放页共用
+    val podcastState: StateFlow<PodcastPlayerState> = podcastPlayer.state
+
+    // 用户已创建与已收藏的歌单 ID 集合，供首页推荐卡片和最近播放判断是否展示“收藏歌单”
+    private val _subscribedPlaylistIds = MutableStateFlow<Set<Long>>(emptySet())
+    val subscribedPlaylistIds: StateFlow<Set<Long>> = _subscribedPlaylistIds.asStateFlow()
+
+    fun toggleSubscribe() = podcastPlayer.toggleSubscribe { _toastEvent.emit(it) }
+
+    init {
+        loadHomeData()
+        viewModelScope.launch {
+            playerManager.initController()
+        }
+        viewModelScope.launch {
+            playbackRepository.playlistRecorded.collect { refreshRecentPlaylists() }
+        }
+        // 离线转在线后重新拉取，替换离线时展示的缓存；首页尚未加载成功时走完整加载
+        viewModelScope.launch {
+            var wasOnline = onlineState.isOnline()
+            onlineState.online.collect { online ->
+                if (online && !wasOnline) {
+                    if (_uiState.value is HomeUiState.Success) refreshHomeData() else loadHomeData()
+                }
+                wasOnline = online
+            }
+        }
+        viewModelScope.launch {
+            userProfile.collect { profile ->
+                if (profile != null) {
+                    loadLikedSongIdsUseCase()
+                    userPlaylistRepository.getUserPlaylists(profile.uid).collect { result ->
+                        result.getOrNull()?.let { list ->
+                            _subscribedPlaylistIds.value = list.map { it.id }.toSet()
+                        }
+                    }
+                } else {
+                    _subscribedPlaylistIds.value = emptySet()
+                }
+            }
+        }
+    }
+
+    fun prepareCollectDialog(songId: Long) {
+        viewModelScope.launch {
+            songCollectDelegate.prepare(songId, songLikeRepository.likedSongIds.value) { _toastEvent.emit(it) }
+        }
+    }
+
+    fun savePlaylistCollection(songId: Long, items: List<PlaylistCollectItem>) {
+        viewModelScope.launch {
+            songCollectDelegate.save(
+                songId = songId,
+                items = items,
+                likedSongIds = songLikeRepository.likedSongIds.value,
+                onToast = { _toastEvent.emit(it) },
+                onLikedChanged = { newLiked ->
+                    songLikeRepository.syncLikedSongIds(newLiked)
+                }
+            )
+        }
+    }
+
+    fun createPlaylistAndAddSong(name: String, songId: Long) {
+        viewModelScope.launch {
+            songCollectDelegate.createAndAdd(name, songId, songLikeRepository.likedSongIds.value) { _toastEvent.emit(it) }
+        }
+    }
+
+    fun loadHomeData(refresh: Boolean = false) {
+        _uiState.value = HomeUiState.Loading
+
+        viewModelScope.launch {
+            val result = fetchHomeFeedData(refresh)
+            _uiState.value = result.fold(
+                onSuccess = { HomeUiState.Success(it) },
+                onFailure = { HomeUiState.Error(it.toUserMessage(resourceProvider)) }
+            )
+        }
+    }
+
+    // 下拉刷新：保留当前已渲染内容不被清空，成功后整体替换，失败仅提示、不打断原有展示
+    fun refreshHomeData() {
+        if (_isRefreshing.value) return
+        _isRefreshing.value = true
+
+        viewModelScope.launch {
+            fetchHomeFeedData(refresh = true).fold(
+                onSuccess = { _uiState.value = HomeUiState.Success(it) },
+                onFailure = { _toastEvent.emit(it.toUserMessage(resourceProvider)) }
+            )
+            _isRefreshing.value = false
+        }
+    }
+
+    // 仅替换最近播放一块；失败或首页尚未加载完时保持原状
+    private suspend fun refreshRecentPlaylists() {
+        val latest = runCatching { recentRepository.getRecentPlaylists().first() }
+            .getOrNull()?.getOrNull() ?: return
+        val current = _uiState.value as? HomeUiState.Success ?: return
+        _uiState.value = HomeUiState.Success(current.data.copy(recentPlaylists = latest))
+    }
+
+    // 货架序列是整页主数据源，它失败才算整页失败；其余几项各自兜底不影响渲染
+    private suspend fun fetchHomeFeedData(refresh: Boolean): Result<HomeFeedData> = try {
+        coroutineScope {
+            val blockPageDeferred = async {
+                homeRepository.getHomeBlockPage(refresh = refresh).first()
+            }
+
+            val playlistsDeferred = async {
+                runCatching { homeRepository.getPersonalizedPlaylists().first() }
+                    .getOrDefault(Result.success(PersonalizedData()))
+            }
+
+            val recentDeferred = async {
+                runCatching { recentRepository.getRecentPlaylists().first() }
+                    .getOrDefault(Result.success(emptyList()))
+            }
+
+            val dailySongsDeferred = async {
+                runCatching { homeRepository.getDailyRecommendSongs().first() }
+                    .getOrDefault(Result.success(emptyList()))
+            }
+
+            val toplistDeferred = async {
+                runCatching { homeRepository.getToplistDetail().first() }
+                    .getOrDefault(Result.success(emptyList<ToplistInfo>()))
+            }
+
+            val blockPageResult = blockPageDeferred.await()
+            val playlistsResult = playlistsDeferred.await()
+            val recentResult = recentDeferred.await()
+            val dailySongsResult = dailySongsDeferred.await()
+            val toplistResult = toplistDeferred.await()
+
+            val blockPage = blockPageResult.getOrNull()
+            if (blockPage != null) {
+                Result.success(
+                    HomeFeedData(
+                        shelves = blockPage.shelves,
+                        recommendPlaylists = playlistsResult.getOrNull()?.playlists.orEmpty(),
+                        recentPlaylists = recentResult.getOrDefault(emptyList()),
+                        dailySongs = dailySongsResult.getOrDefault(emptyList()),
+                        toplistItems = toplistResult.getOrDefault(emptyList()),
+                        nextCursor = blockPage.nextCursor,
+                        hasMore = blockPage.hasMore
+                    )
+                )
+            } else {
+                Result.failure(
+                    blockPageResult.exceptionOrNull()
+                        ?: RuntimeException(resourceProvider.getString(AppString.ErrorBizDefault))
+                )
+            }
+        }
+    } catch (e: Exception) {
+        Result.failure(e)
+    }
+
+    // 滚到底时追加下一页货架。服务端目前只有两页，翻完 hasMore 即为 false
+    fun loadMoreShelves() {
+        val current = _uiState.value as? HomeUiState.Success ?: return
+        val cursor = current.data.nextCursor ?: return
+        if (current.data.isLoadingMore) return
+
+        _uiState.value = HomeUiState.Success(current.data.copy(isLoadingMore = true))
+
+        viewModelScope.launch {
+            val result = runCatching { homeRepository.getHomeBlockPage(cursor = cursor).first() }
+                .getOrNull()
+                ?.getOrNull()
+
+            val latest = _uiState.value as? HomeUiState.Success ?: return@launch
+            _uiState.value = if (result == null) {
+                // 追加失败不打断已渲染内容，仅收起加载态并停止继续翻页
+                AppLogger.w(TAG, "翻页失败，停止继续加载货架")
+                HomeUiState.Success(latest.data.copy(isLoadingMore = false, hasMore = false, nextCursor = null))
+            } else {
+                HomeUiState.Success(
+                    latest.data.copy(
+                        shelves = latest.data.shelves + result.shelves,
+                        nextCursor = result.nextCursor,
+                        hasMore = result.hasMore,
+                        isLoadingMore = false
+                    )
+                )
+            }
+        }
+    }
+
+    fun playDailySong(index: Int = 0) {
+        val state = uiState.value
+        if (state is HomeUiState.Success && state.data.dailySongs.isNotEmpty()) {
+            val queueItems = state.data.dailySongs.map { song ->
+                QueueItem(song.id, song.name, song.ar.joinToString { it.name }, song.al.picUrl)
+            }
+            playerManager.playQueue(queueItems, index.coerceIn(0, queueItems.size - 1), "每日推荐")
+        } else {
+            viewModelScope.launch { _toastEvent.emit("每日推荐暂无歌曲") }
+        }
+    }
+
+    private val collectionActions = CollectionActionsDelegate(
+        playlistRepository, playerManager, songDownloadManager, playlistMutationBus, resourceProvider
+    )
+
+    // 卡片上直接播放歌单/专辑：先拉详情，歌单还要补全被服务端截断的曲目，再整列起播
+    fun playCollection(id: Long, isAlbum: Boolean) {
+        viewModelScope.launch { collectionActions.play(id, isAlbum) { _toastEvent.emit(it) } }
+    }
+
+    // 歌单或专辑全部加入下一首播放
+    fun addCollectionToPlayNext(id: Long, isAlbum: Boolean) {
+        viewModelScope.launch { collectionActions.addToPlayNext(id, isAlbum) { _toastEvent.emit(it) } }
+    }
+
+    // 批量下载歌单或专辑
+    fun downloadCollection(id: Long, isAlbum: Boolean, level: String) {
+        viewModelScope.launch {
+            collectionActions.download(id, isAlbum, level, "home_collection_$id") { _toastEvent.emit(it) }
+        }
+    }
+
+    // 收藏歌单
+    fun subscribePlaylist(playlistId: Long) {
+        viewModelScope.launch {
+            if (collectionActions.subscribePlaylist(playlistId) { _toastEvent.emit(it) }) {
+                _subscribedPlaylistIds.value = _subscribedPlaylistIds.value + playlistId
+            }
+        }
+    }
+
+    // 播放货架里的单曲，队列取同一货架内的全部歌曲卡片，播完能自动接续下一首
+    fun playShelfSong(shelfTitle: String, songs: List<HomeCard.Song>, song: HomeCard.Song) {
+        val queueItems = songs.map { QueueItem(it.id, it.title, "", it.coverUrl) }
+        val startIndex = songs.indexOf(song).coerceAtLeast(0)
+        playerManager.playQueue(queueItems, startIndex, playContext = shelfTitle)
+    }
+
+    fun addShelfSongToPlayNext(song: HomeCard.Song) {
+        playerManager.addToPlayNext(listOf(QueueItem(song.id, song.title, "", song.coverUrl)))
+        viewModelScope.launch { _toastEvent.emit("已添加至下一首播放") }
+    }
+
+    fun playShelfVoice(shelfTitle: String, voices: List<HomeCard.Voice>, voice: HomeCard.Voice) {
+        val queueItems = voices.map { QueueItem(it.songId, it.title, it.caption, it.coverUrl) }
+        val startIndex = voices.indexOf(voice).coerceAtLeast(0)
+        playerManager.playQueue(queueItems, startIndex, playContext = shelfTitle)
+    }
+
+    fun addShelfVoiceToPlayNext(voice: HomeCard.Voice) {
+        playerManager.addToPlayNext(listOf(QueueItem(voice.songId, voice.title, voice.caption, voice.coverUrl)))
+        viewModelScope.launch { _toastEvent.emit("已添加至下一首播放") }
+    }
+
+    fun togglePlayPause() {
+        playerManager.togglePlayPause()
+    }
+
+    fun handleLoginSuccess(cookies: String) {
+        viewModelScope.launch {
+            val profile = syncProfileAfterLoginUseCase(cookies)
+            if (profile == null) {
+                _toastEvent.emit("登录失败，会话无效或网络异常，请重试")
+                return@launch
+            }
+            _toastEvent.emit("登录成功，欢迎回来，${profile.nickname}！")
+            loadHomeData()
+        }
+    }
+
+    fun logout() {
+        viewModelScope.launch {
+            authRepository.logout().collect { }
+            userPreferences.clearUserProfile()
+            _toastEvent.emit("已退出登录")
+            loadHomeData()
+        }
+    }
+
+    // 开启相似歌曲漫游
+    fun startRoaming() {
+        val current = playerManager.nowPlaying.value
+        if (current != null) {
+            val songId = current.songId ?: return
+            val title = current.title
+            val artist = current.artist
+            val coverUrl = current.artworkUri.orEmpty()
+            viewModelScope.launch {
+                playbackRepository.getSimilarSongs(songId).collect { result ->
+                    result.onSuccess { simiSongs ->
+                        if (simiSongs.isNotEmpty()) {
+                            val currentItem = QueueItem(songId, title, artist, coverUrl)
+                            val simiItems = simiSongs.map { track ->
+                                QueueItem(
+                                    songId = track.id,
+                                    title = track.name,
+                                    artist = track.ar.joinToString("/") { it.name },
+                                    coverUrl = track.al.picUrl
+                                )
+                            }
+                            val roamingQueue = listOf(currentItem) + simiItems
+                            playerManager.playQueue(roamingQueue, 0, playContext = "similar_roaming")
+                            _toastEvent.emit("已开启相似歌曲漫游")
+                        } else {
+                            _toastEvent.emit("未找到相关相似歌曲")
+                        }
+                    }.onFailure {
+                        _toastEvent.emit(it.toUserMessage(resourceProvider))
+                    }
+                }
+            }
+        } else {
+            val state = uiState.value
+            if (state is HomeUiState.Success && state.data.dailySongs.isNotEmpty()) {
+                val firstSong = state.data.dailySongs.first()
+                viewModelScope.launch {
+                    playbackRepository.getSimilarSongs(firstSong.id).collect { result ->
+                        result.onSuccess { simiSongs ->
+                            val currentItem = QueueItem(firstSong.id, firstSong.name, firstSong.ar.joinToString("/") { it.name }, firstSong.al.picUrl)
+                            val simiItems = simiSongs.map { track ->
+                                QueueItem(track.id, track.name, track.ar.joinToString("/") { it.name }, track.al.picUrl)
+                            }
+                            val roamingQueue = listOf(currentItem) + simiItems
+                            playerManager.playQueue(roamingQueue, 0, playContext = "similar_roaming")
+                            _toastEvent.emit("已为您开启《${firstSong.name}》的漫游")
+                        }.onFailure {
+                            _toastEvent.emit(it.toUserMessage(resourceProvider))
+                        }
+                    }
+                }
+            } else {
+                viewModelScope.launch { _toastEvent.emit("播放列表中没有歌曲且无法获取今日推荐") }
+            }
+        }
+    }
+
+    // 开启心动模式
+    fun startIntelligenceMode() {
+        val current = playerManager.nowPlaying.value
+        if (current != null) {
+            val songId = current.songId ?: return
+            viewModelScope.launch {
+                playbackRepository.getIntelligenceSongs(songId, 0).collect { result ->
+                    result.onSuccess { tracks ->
+                        if (tracks.isNotEmpty()) {
+                            val currentItem = QueueItem(
+                                songId,
+                                current.title,
+                                current.artist,
+                                current.artworkUri.orEmpty()
+                            )
+                            val items = listOf(currentItem) + tracks.map { track ->
+                                QueueItem(track.id, track.name, track.ar.joinToString("/") { it.name }, track.al.picUrl)
+                            }
+                            playerManager.playQueue(items, 0, playContext = PlaybackController.CONTEXT_INTELLIGENCE)
+                            _toastEvent.emit("已开启心动模式")
+                        } else {
+                            _toastEvent.emit("获取心动推荐失败")
+                        }
+                    }.onFailure {
+                        _toastEvent.emit(it.toUserMessage(resourceProvider))
+                    }
+                }
+            }
+        } else {
+                                    val state = uiState.value
+                                        if (state is HomeUiState.Success && state.data.dailySongs.isNotEmpty()) {
+                                            val firstSong = state.data.dailySongs.first()
+                                            viewModelScope.launch {
+                                                playbackRepository.getIntelligenceSongs(firstSong.id, 0).collect { result ->
+                                                    result.onSuccess { tracks ->
+                                                        val currentItem = QueueItem(firstSong.id, firstSong.name, firstSong.ar.joinToString("/") { it.name }, firstSong.al.picUrl)
+                                                        val items = listOf(currentItem) + tracks.map { track ->
+                                                            QueueItem(track.id, track.name, track.ar.joinToString("/") { it.name }, track.al.picUrl)
+                            }
+                            playerManager.playQueue(items, 0, playContext = PlaybackController.CONTEXT_INTELLIGENCE)
+                            _toastEvent.emit("已从《${firstSong.name}》开启心动模式")
+                        }.onFailure {
+                            _toastEvent.emit(it.toUserMessage(resourceProvider))
+                        }
+                    }
+                }
+            } else {
+                viewModelScope.launch { _toastEvent.emit("请先播放一首歌曲") }
+            }
+        }
+    }
+}

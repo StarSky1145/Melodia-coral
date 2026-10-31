@@ -1,0 +1,537 @@
+package com.lin0721.linmusic.feature.playlist.ui
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CenterFocusStrong
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import com.lin0721.linmusic.LocalBottomOverlayInset
+import com.lin0721.linmusic.core.model.Track
+import com.lin0721.linmusic.core.ui.components.PlaylistCollectItem
+import com.lin0721.linmusic.core.ui.components.PlaylistCollectSheet
+import com.lin0721.linmusic.core.ui.components.PlaylistCollectState
+import com.lin0721.linmusic.core.ui.components.TrackSelectionOverlay
+import com.lin0721.linmusic.core.ui.components.rememberSelectionBottomPadding
+import com.lin0721.linmusic.core.ui.components.SelectionAction
+import com.lin0721.linmusic.core.ui.components.TrackSelectionUi
+import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
+import com.lin0721.linmusic.core.ui.theme.darken
+import com.lin0721.linmusic.core.model.PlaylistDetail
+import com.lin0721.linmusic.core.ui.theme.FallbackBase
+import com.lin0721.linmusic.core.ui.theme.melodiaStatusBarTopPadding
+import com.lin0721.linmusic.core.ui.theme.uiEnter
+import com.lin0721.linmusic.core.ui.theme.uiExit
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
+import kotlin.math.max
+
+// TopBar 操作区高度（不含状态栏）
+private val TOP_BAR_HEIGHT = 56.dp
+// 封面固定尺寸
+private val COVER_MAX_SIZE = 260.dp
+
+// ────────────────────────────────────────────────────────────────────────────
+// 主内容：折叠状态计算 + 各区块装配
+// ────────────────────────────────────────────────────────────────────────────
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PlaylistContent(
+    playlist: PlaylistDetail,
+    currentTrackId: String?,
+    isPlaying: Boolean,
+    likedSongIds: Set<Long>,
+    unplayableIds: Set<Long> = emptySet(),
+    collectState: PlaylistCollectState,
+    isLoggedIn: Boolean,
+    recommendedSongs: List<Track>,
+    onBack: () -> Unit,
+    onArtistClick: (Long) -> Unit,
+    onAlbumClick: (Long) -> Unit,
+    onToggleLike: (Long, Boolean) -> Unit,
+    onPlaySong: (Track) -> Unit,
+    onPlayRecommendedSong: (Track) -> Unit,
+    onAddToPlayNext: (Track) -> Unit,
+    onPlayAll: () -> Unit,
+    onShuffleToggle: () -> Unit,
+    isShuffleActive: Boolean,
+    isCurrentlyPlayingThis: Boolean,
+    onLikeClick: (Long) -> Unit,
+    onSaveCollection: (Long, List<PlaylistCollectItem>) -> Unit,
+    onSaveNewCollection: (String, Long) -> Unit,
+    onRequireLogin: () -> Unit,
+    onRefreshRecommendations: () -> Unit,
+    onAddRecommendSong: (Track) -> Unit,
+    isSubscribed: Boolean,
+    onSubscribeClick: () -> Unit,
+    onCommentsClick: () -> Unit,
+    onMoreClick: () -> Unit,
+    isLikedSongsPlaylistView: Boolean = false,
+    onShareClick: () -> Unit = {},
+    onDownloadClick: () -> Unit = {},
+    onDownloadSongClick: (Track) -> Unit = {},
+    onHistoryClick: () -> Unit = {},
+    historyDates: List<String> = emptyList(),
+    historySongsLoading: Boolean = false,
+    showHistoryDatePicker: Boolean = false,
+    selectedHistoryDate: String = "今天",
+    onSelectedHistoryDateChange: (String) -> Unit = {},
+    onLoadHistoryDetail: (String) -> Unit = {},
+    onLoadDailyRecommend: () -> Unit = {},
+    onReduceRecommend: (Long) -> Unit = {},
+    canRemoveFromPlaylist: Boolean = false,
+    onRemoveFromPlaylist: (Long) -> Unit = {},
+    onAddMusicClick: () -> Unit = {},
+    onEditOrderClick: () -> Unit = {},
+    onEditInfoClick: () -> Unit = {},
+    hasMoreTracks: Boolean = false,
+    isLoadingMoreTracks: Boolean = false,
+    onLoadMoreTracks: () -> Unit = {},
+    onLocateTrack: (Long) -> Unit = {},
+    onCreatorClick: (Long) -> Unit = {},
+    trackPlayCounts: Map<Long, Int> = emptyMap(),
+    selectionUi: TrackSelectionUi = TrackSelectionUi(),
+    selectionActions: List<SelectionAction> = emptyList(),
+    onToggleSelectAll: (List<Long>) -> Unit = {},
+    onExitSelection: () -> Unit = {}
+) {
+    val motion = LocalUiMotion.current
+    val density = LocalDensity.current
+
+    val isDailyRecommend = playlist.id == -1L || playlist.id == -2L
+    // 搜索栏统一为 item 0，无需按是否每日推荐区分初始位置
+    val listState = rememberLazyListState()
+    val coroutineScope = rememberCoroutineScope()
+
+    val canLoadMoreTracks = hasMoreTracks && !isLoadingMoreTracks
+    LaunchedEffect(listState, canLoadMoreTracks) {
+        if (!canLoadMoreTracks) return@LaunchedEffect
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            lastVisible >= info.totalItemsCount - 3
+        }
+            .distinctUntilChanged()
+            .collect { if (it) onLoadMoreTracks() }
+    }
+
+    var searchQuery by remember { mutableStateOf("") }
+    var sortOption by remember { mutableStateOf(PlaylistSortOption.DEFAULT) }
+    var showSortSheet by remember { mutableStateOf(false) }
+    val sortedTracks = remember(playlist.tracks, sortOption) { sortOption.sort(playlist.tracks) }
+    val filteredTracks = remember(sortedTracks, searchQuery) {
+        if (searchQuery.isBlank()) sortedTracks
+        else sortedTracks.filter {
+            it.name.contains(searchQuery, true) || it.ar.any { a -> a.name.contains(searchQuery, true) }
+        }
+    }
+
+    // ── 定位当前播放歌曲：目标不在已加载/未过滤出的范围内时展示悬浮按钮
+    val targetTrackId = currentTrackId?.toLongOrNull()
+    val belongsToPlaylist = remember(playlist.trackIds, playlist.tracks, targetTrackId) {
+        targetTrackId != null && if (playlist.trackIds.isNotEmpty()) {
+            playlist.trackIds.any { it.id == targetTrackId }
+        } else {
+            playlist.tracks.any { it.id == targetTrackId }
+        }
+    }
+    // 曲目行在 LazyColumn 里的起始下标：header + 视条件出现的胶囊行/日期行
+    val trackListStartIndex = 1 +
+        (if (canRemoveFromPlaylist && !isDailyRecommend) 1 else 0) +
+        (if (playlist.id == -1L && showHistoryDatePicker) 1 else 0) +
+        (if (playlist.id == -2L) 1 else 0)
+
+    val targetIndexInFiltered = remember(filteredTracks, targetTrackId) {
+        if (targetTrackId == null) -1 else filteredTracks.indexOfFirst { it.id == targetTrackId }
+    }
+    val isTargetVisibleOnScreen by remember(targetIndexInFiltered, trackListStartIndex, historySongsLoading) {
+        derivedStateOf {
+            if (targetIndexInFiltered < 0 || historySongsLoading) return@derivedStateOf false
+            val itemIndex = trackListStartIndex + targetIndexInFiltered
+            listState.layoutInfo.visibleItemsInfo.any { it.index == itemIndex }
+        }
+    }
+    val showLocateButton = belongsToPlaylist && !historySongsLoading && !isTargetVisibleOnScreen
+
+    // 从封面提取的主色调，默认为深灰色
+    var dominantColor by remember { mutableStateOf(FallbackBase) }
+
+    // 获取系统状态栏高度
+    val statusBarHeight = melodiaStatusBarTopPadding()
+    // Overlay 总高度：状态栏 + 操作区(56dp)
+    val overlayHeight = TOP_BAR_HEIGHT + statusBarHeight
+
+    var pendingLocateTrackId by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(pendingLocateTrackId, filteredTracks) {
+        val id = pendingLocateTrackId ?: return@LaunchedEffect
+        val index = filteredTracks.indexOfFirst { it.id == id }
+        if (index < 0) return@LaunchedEffect
+        val itemIndex = trackListStartIndex + index
+        // 先粗定位让目标行进入可测量范围，再用真实测量结果二次校正，使其停在屏幕正中央
+        motion.scrollToItem(listState, itemIndex)
+        val info = listState.layoutInfo
+        val itemInfo = info.visibleItemsInfo.find { it.index == itemIndex }
+        if (itemInfo != null) {
+            //可视区域要从 overlayHeight 之后算起，否则会偏上
+            val overlayHeightPx = with(density) { overlayHeight.toPx() }
+            val visibleTop = info.viewportStartOffset + overlayHeightPx
+            val visibleCenter = (visibleTop + info.viewportEndOffset) / 2f
+            val itemCenter = itemInfo.offset + itemInfo.size / 2f
+            val delta = itemCenter - visibleCenter
+            if (kotlin.math.abs(delta) > 1f) motion.scrollBy(listState, delta)
+        }
+        pendingLocateTrackId = null
+    }
+
+    // 折叠进度 0f→1f（从封面完整显示到完全折叠）；header 恒为 item 0，两种歌单共用同一套计算
+    val collapseThresholdPx = with(density) { 300.dp.toPx() }
+    val progress by remember {
+        derivedStateOf {
+            if (listState.firstVisibleItemIndex == 0) {
+                (listState.firstVisibleItemScrollOffset / collapseThresholdPx).coerceIn(0f, 1f)
+            } else {
+                1f
+            }
+        }
+    }
+
+    val coverSize: Dp     = COVER_MAX_SIZE
+
+    // 播放按钮停靠位：按钮中心正好卡在顶栏下边缘
+    val dockedYPx = with(density) { (overlayHeight - 28.dp).toPx() }
+    // 按钮在完全未滚动时的基准 Y（由 PlaylistHeaderItem 里那个透明占位按钮上报，
+    // 只在滚到顶部时才接受更新，滚动过程中不重新测量）
+    // 用listState.firstVisibleItemScrollOffset 做数学换算得到实时位置
+    // 已知问题：切换播放/暂停图标会让按钮跳一下，根因还没查清楚，先放着
+    var playButtonBaselineYPx by remember { mutableFloatStateOf(Float.MAX_VALUE) }
+
+    var collectSongId by remember { mutableStateOf<Long?>(null) }
+    var activeSongMoreOptions by remember { mutableStateOf<Track?>(null) }
+
+    val searchBarRevealState = rememberSearchBarRevealState(
+        listState        = listState,
+        isDailyRecommend = isDailyRecommend
+    )
+    val searchFullyRevealed = searchBarRevealState.isOpen
+
+    // 搜索展开中拦截系统返回：先关搜索，不直接退出歌单页
+    BackHandler(enabled = searchBarRevealState.isOpen) {
+        searchBarRevealState.close()
+    }
+    BackHandler(enabled = selectionUi.active) {
+        onExitSelection()
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+
+        // ── 1. 滚动内容：整体随 revealPx 下移，让出顶部空间给搜索栏 ───────────
+        LazyColumn(
+            state          = listState,
+            contentPadding = PaddingValues(bottom = LocalBottomOverlayInset.current + 16.dp + rememberSelectionBottomPadding(selectionUi.active)),
+            modifier       = Modifier
+                .graphicsLayer { translationY = searchBarRevealState.revealPx }
+                .nestedScroll(searchBarRevealState.connection)
+        ) {
+            // Item 0：全出血 Hero；搜索展开意图确定后淡出收起，让出空间给搜索结果
+            item(key = "header") {
+                Box(modifier = Modifier.heightIn(min = 1.dp)) {
+                    AnimatedVisibility(
+                        visible = !searchFullyRevealed,
+                        enter   = uiEnter(fadeIn() + expandVertically(expandFrom = Alignment.Top)),
+                        exit    = uiExit(fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top))
+                    ) {
+                        PlaylistHeaderItem(
+                            playlist            = playlist,
+                            coverSize           = coverSize,
+                            progressProvider    = { progress },
+                            statusBarHeight     = statusBarHeight,
+                            dominantColor       = dominantColor,
+                            onColorCalculated   = { dominantColor = it },
+                            onPlayAll              = onPlayAll,
+                            onShuffleToggle        = onShuffleToggle,
+                            isShuffleActive        = isShuffleActive,
+                            isCurrentlyPlayingThis = isCurrentlyPlayingThis,
+                            isSubscribed        = isSubscribed,
+                            onSubscribeClick    = onSubscribeClick,
+                            onCommentsClick     = onCommentsClick,
+                            onMoreClick         = onMoreClick,
+                            isLikedSongsPlaylistView = isLikedSongsPlaylistView,
+                            isOwnedPlaylist     = canRemoveFromPlaylist,
+                            onShareClick        = onShareClick,
+                            onDownloadClick     = onDownloadClick,
+                            onHistoryClick      = onHistoryClick,
+                            selectedHistoryDate = selectedHistoryDate,
+                            onCreatorClick      = onCreatorClick,
+                            onPlayButtonPositioned = { y ->
+                                if (listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
+                                    playButtonBaselineYPx = y
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
+            // 自建歌单快捷操作小胶囊行；搜索展开意图确定后同样淡出收起
+            if (canRemoveFromPlaylist && !isDailyRecommend) {
+                item(key = "action_pills") {
+                    AnimatedVisibility(
+                        visible = !searchFullyRevealed,
+                        enter   = uiEnter(fadeIn() + expandVertically(expandFrom = Alignment.Top)),
+                        exit    = uiExit(fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top))
+                    ) {
+                        PlaylistActionPillsRow(
+                            isOwnedPlaylist = canRemoveFromPlaylist,
+                            isTracksEmpty = playlist.tracks.isEmpty(),
+                            currentSortOption = sortOption,
+                            onAddMusicClick = onAddMusicClick,
+                            onEditOrderClick = {
+                                // 拖拽排的是歌单真实顺序。停留在本地排序视图时进入重排，列表会突然跳回默认序，
+                                // 保存后回来又被排序规则盖住看不到结果，因此进入前先把视图切回默认
+                                sortOption = PlaylistSortOption.DEFAULT
+                                onEditOrderClick()
+                            },
+                            onSortClick = { showSortSheet = true },
+                            onEditInfoClick = onEditInfoClick
+                        )
+                    }
+                }
+            }
+
+            if (playlist.id == -1L && showHistoryDatePicker) {
+                item(key = "history_date_picker") {
+                    PlaylistHistoryDateRow(
+                        historyDates                = historyDates,
+                        selectedHistoryDate         = selectedHistoryDate,
+                        onSelectedHistoryDateChange = onSelectedHistoryDateChange,
+                        onLoadHistoryDetail         = onLoadHistoryDetail,
+                        onLoadDailyRecommend        = onLoadDailyRecommend
+                    )
+                }
+            }
+
+            if (playlist.id == -2L) {
+                item(key = "user_record_filter") {
+                    PlaylistRecordFilterRow(
+                        selectedHistoryDate         = selectedHistoryDate,
+                        onSelectedHistoryDateChange = onSelectedHistoryDateChange,
+                        onLoadHistoryDetail         = onLoadHistoryDetail
+                    )
+                }
+            }
+
+            if (historySongsLoading) {
+                item(key = "history_songs_loading") {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                    }
+                }
+            } else {
+                playlistTrackItems(
+                    tracks             = filteredTracks,
+                    currentTrackId     = currentTrackId,
+                    isPlaying          = isPlaying,
+                    likedSongIds       = likedSongIds,
+                    isLoggedIn         = isLoggedIn,
+                    onPlaySong         = onPlaySong,
+                    onLikeClick        = onLikeClick,
+                    onOpenCollectSheet = { collectSongId = it },
+                    onToggleLike       = onToggleLike,
+                    onMoreClick        = { activeSongMoreOptions = it },
+                    trackPlayCounts    = trackPlayCounts,
+                    unplayableIds      = unplayableIds,
+                    selectionUi        = selectionUi
+                )
+
+                if (isLoadingMoreTracks) {
+                    item(key = "track_load_more") {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                }
+            }
+
+            // 推荐歌曲板块；搜索展开中不显示，避免跟搜索结果混在一起
+            if (recommendedSongs.isNotEmpty() && !searchFullyRevealed) {
+                playlistRecommendItems(
+                    recommendedSongs         = recommendedSongs,
+                    currentTrackId           = currentTrackId,
+                    isPlaying                = isPlaying,
+                    onRefreshRecommendations = onRefreshRecommendations,
+                    onPlaySong               = onPlayRecommendedSong,
+                    onAddRecommendSong       = onAddRecommendSong
+                )
+            }
+        }
+
+        // ── 2. 搜索栏浮层：隐藏时整体位移到屏幕外上方，随 revealPx 跟手展开 ─────
+        if (!isDailyRecommend) {
+            SearchBarItem(
+                query              = searchQuery,
+                onQueryChange      = { searchQuery = it },
+                topPadding         = overlayHeight,
+                backgroundColor    = dominantColor,
+                modifier           = Modifier
+                    .onSizeChanged { searchBarRevealState.searchBarHeightPx = it.height.toFloat() }
+                    .graphicsLayer {
+                        translationY = searchBarRevealState.revealPx - searchBarRevealState.searchBarHeightPx
+                    }
+            )
+        }
+
+        // ── 3. 固定 Overlay ───────────────────────────────────────────────
+        PlaylistTopBar(
+            title            = playlist.name,
+            progressProvider = { if (searchFullyRevealed) 1f else progress },
+            overlayHeight    = overlayHeight,
+            statusBarHeight  = statusBarHeight,
+            dominantColor    = dominantColor,
+            // 搜索展开中：返回箭头先关搜索，不直接退出歌单页
+            onBack           = {
+                if (searchBarRevealState.isOpen) searchBarRevealState.close() else onBack()
+            },
+            onScrollToTop    = {
+                coroutineScope.launch {
+                    motion.scrollToItem(listState, 0)
+                }
+            }
+        )
+
+        val visibleTrackIds = remember(filteredTracks) { filteredTracks.map { it.id } }
+        val selectionHeaderColor = remember(dominantColor) { dominantColor.darken(0.35f) }
+        TrackSelectionOverlay(
+            selectionUi = selectionUi,
+            actions = selectionActions,
+            visibleIds = visibleTrackIds,
+            headerColor = selectionHeaderColor,
+            onToggleSelectAll = onToggleSelectAll,
+            onExit = onExitSelection
+        )
+
+        // 播放按钮跟手滑动、到位后锁停；搜索展开到位后一并隐藏
+        if (!isDailyRecommend && !searchFullyRevealed && !selectionUi.active) {
+            PlaylistDockedPlayButton(
+                dockedOffsetYProvider = {
+                    val naturalY = if (listState.firstVisibleItemIndex == 0) {
+                        playButtonBaselineYPx - listState.firstVisibleItemScrollOffset
+                    } else {
+                        -Float.MAX_VALUE
+                    }
+                    max(naturalY, dockedYPx)
+                },
+                isCurrentlyPlayingThis = isCurrentlyPlayingThis,
+                onPlayAll              = onPlayAll
+            )
+        }
+
+        // 定位到正在播放的歌曲，只有目标属于本歌单且不在可见范围内才出现
+        if (showLocateButton && !selectionUi.active) {
+            FloatingActionButton(
+                onClick = {
+                    val id = targetTrackId ?: return@FloatingActionButton
+                    if (searchQuery.isNotEmpty()) searchQuery = ""
+                    pendingLocateTrackId = id
+                    if (sortedTracks.none { it.id == id }) {
+                        onLocateTrack(id)
+                    }
+                },
+                containerColor = MaterialTheme.colorScheme.primary,
+                shape = CircleShape,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = LocalBottomOverlayInset.current + 16.dp)
+                    .size(48.dp)
+            ) {
+                if (isLoadingMoreTracks) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.CenterFocusStrong,
+                        contentDescription = "定位到正在播放的歌曲",
+                        tint = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+            }
+        }
+    }
+
+    if (collectSongId != null) {
+        PlaylistCollectSheet(
+            songId = collectSongId!!,
+            collectState = collectState,
+            onDismiss = { collectSongId = null },
+            onSaveCollection = onSaveCollection,
+            onSaveNewCollection = onSaveNewCollection
+        )
+    }
+
+    if (activeSongMoreOptions != null) {
+        val track = activeSongMoreOptions!!
+        PlaylistSongOptionsSheet(
+            track = track,
+            isLiked = track.id in likedSongIds,
+            isLoggedIn = isLoggedIn,
+            onDismiss = { activeSongMoreOptions = null },
+            onAddToPlayNext = onAddToPlayNext,
+            onToggleLike = onToggleLike,
+            onCollectClick = { songId ->
+                collectSongId = songId
+                onLikeClick(songId)
+            },
+            onArtistClick = onArtistClick,
+            onAlbumClick = onAlbumClick,
+            onRequireLogin = onRequireLogin,
+            canRemoveFromPlaylist = canRemoveFromPlaylist,
+            onRemoveFromPlaylist = onRemoveFromPlaylist,
+            onDownloadClick = onDownloadSongClick,
+            onReduceRecommend = if (playlist.id == -1L && selectedHistoryDate == "今天" && isLoggedIn) {
+                { onReduceRecommend(it.id) }
+            } else {
+                null
+            }
+        )
+    }
+
+    if (showSortSheet) {
+        PlaylistSortSheet(
+            sortOption = sortOption,
+            onSortOptionChange = {
+                sortOption = it
+                showSortSheet = false
+            },
+            onDismiss = { showSortSheet = false }
+        )
+    }
+}
+

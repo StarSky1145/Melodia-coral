@@ -1,0 +1,618 @@
+package com.lin0721.linmusic.core.ui.components
+
+import android.media.AudioDeviceInfo
+import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddBox
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.LibraryMusic
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.outlined.CloudQueue
+import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.rounded.AddCircleOutline
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Favorite
+import androidx.compose.material.icons.rounded.FavoriteBorder
+import androidx.compose.material.icons.rounded.SkipNext
+import com.lin0721.linmusic.core.preferences.BottomBarItem
+import com.lin0721.linmusic.core.preferences.BottomBarItemSetting
+import com.lin0721.linmusic.core.preferences.BottomBarLayout
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animate
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.media3.common.MediaItem
+import com.lin0721.linmusic.Screen
+import com.lin0721.linmusic.core.player.QueueItem
+import com.lin0721.linmusic.core.player.rememberQueueItemCoverUrl
+import com.lin0721.linmusic.core.ui.interaction.pressable
+import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
+import com.lin0721.linmusic.core.ui.theme.MelodiaPress
+import com.lin0721.linmusic.core.ui.theme.BackgroundDark
+import com.lin0721.linmusic.core.ui.theme.SurfaceDark
+import com.lin0721.linmusic.core.ui.theme.TextGray
+import com.lin0721.linmusic.core.ui.theme.extractBackdropPaletteFromUrl
+import com.lin0721.linmusic.core.ui.theme.PaletteMemoryCache
+import com.lin0721.linmusic.core.ui.theme.uiTween
+import dev.chrisbanes.haze.HazeState
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
+import com.lin0721.linmusic.core.ui.theme.FallbackBackdropPalette
+import com.lin0721.linmusic.core.ui.theme.NavPillSelected
+import com.lin0721.linmusic.core.ui.theme.MelodiaSpacing
+import com.lin0721.linmusic.core.ui.theme.InfoCardRadius
+import com.lin0721.linmusic.core.ui.theme.RadiusCompact
+import com.lin0721.linmusic.core.ui.theme.SwipeCoverSpringSpec
+import com.lin0721.linmusic.core.ui.theme.darken
+import com.lin0721.linmusic.feature.player.ui.deviceIcon
+import com.lin0721.linmusic.feature.player.ui.deviceLabel
+import com.lin0721.linmusic.feature.player.ui.rememberCurrentOutputDevice
+import kotlinx.coroutines.delay
+import com.lin0721.linmusic.core.ui.theme.ContentPrimary
+import com.lin0721.linmusic.core.ui.theme.styledCorners
+
+//悬浮播放控制卡片
+
+// 迷你条左侧动作：歌曲收藏到歌单、播客订阅电台，无法订阅时隐藏
+enum class MiniPlayerLikeMode { Collect, Subscribe, Hidden }
+
+@Composable
+fun MiniPlayerCard(
+    currentTrack: MediaItem?,
+    isPlaying: Boolean,
+    currentPositionProvider: () -> Long,
+    duration: Long,
+    onTogglePlay: () -> Unit,
+    onNext: () -> Unit,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    hazeState: HazeState? = null,
+    onDrag: ((Float) -> Unit)? = null,
+    onDragEnd: ((Float) -> Unit)? = null,
+    previousQueueItem: QueueItem? = null,
+    nextQueueItem: QueueItem? = null,
+    onPrevious: () -> Unit = {},
+    onCancelPendingSkip: () -> Boolean = { false },
+    isLiked: Boolean = false,
+    onLikeClick: () -> Unit = {},
+    likeMode: MiniPlayerLikeMode = MiniPlayerLikeMode.Collect,
+    expanded: Boolean = false
+) {
+    val motion = LocalUiMotion.current
+    if (currentTrack == null) return
+
+    val context = LocalContext.current
+    val cleanCoverUrl = remember(currentTrack.mediaMetadata.artworkUri) {
+        currentTrack.mediaMetadata.artworkUri?.toString() ?: ""
+    }
+
+    // 缓存并提取背景色，优先从缓存中获取，无缓存则默认为深灰色
+    var colorPalette by remember(currentTrack.mediaId) {
+        mutableStateOf(
+            PaletteMemoryCache.get(currentTrack.mediaId) ?: FallbackBackdropPalette
+        )
+    }
+
+    // 取色跟显示解码完全脱钩，单独发请求；缓存命中就不用再取一次
+    LaunchedEffect(currentTrack.mediaId, cleanCoverUrl) {
+        if (PaletteMemoryCache.get(currentTrack.mediaId) == null && cleanCoverUrl.isNotEmpty()) {
+            val palette = extractBackdropPaletteFromUrl(context, cleanCoverUrl)
+            colorPalette = palette
+            PaletteMemoryCache.put(currentTrack.mediaId, palette)
+        }
+    }
+
+    // 平滑过渡背景色变化；卡片背景在 base 基础上再压暗一档才不会太扎眼。
+    // 平板宽屏下悬浮在深色页面背景上，压暗幅度收窄一档，避免浅色封面取色后和背景融在一起
+    val animatedBase by animateColorAsState(
+        targetValue = colorPalette.base,
+        animationSpec = uiTween(800),
+        label = "mini_player_base"
+    )
+    val fillColor = remember(animatedBase, expanded) { animatedBase.darken(if (expanded) 0.20f else 0.45f) }
+
+    // 左右滑动切歌的手势识别区域是整条悬浮栏
+    // 视觉上是封面+歌名歌手那一行整体跟手平移，靠 SwipeToSkipCoverState 把两者串起来
+    val swipeState = rememberSwipeToSkipCoverState()
+    val swipeDirection = swipeState.syncCurrentKey(
+        key = currentTrack.mediaId,
+        previousKey = previousQueueItem?.songId?.toString(),
+        nextKey = nextQueueItem?.songId?.toString()
+    )
+    var displayedPreviousQueueItem by remember { mutableStateOf(previousQueueItem) }
+    var displayedNextQueueItem by remember { mutableStateOf(nextQueueItem) }
+    // "当前"这一层同样要冻结：过渡期间网络请求随时可能落地，直接用实时 currentTrack
+    // 会让画面在手势进行中被悄悄换成新歌（封面/歌名瞬间跳变）
+    var displayedCurrentTrack by remember { mutableStateOf(currentTrack) }
+    if (!swipeState.isTransitioning) {
+        displayedPreviousQueueItem = previousQueueItem
+        displayedNextQueueItem = nextQueueItem
+        displayedCurrentTrack = currentTrack
+    }
+    val canSwipeToPrevious = displayedPreviousQueueItem != null
+    val canSwipeToNext = displayedNextQueueItem != null
+    val displayedCleanCoverUrl = remember(displayedCurrentTrack.mediaMetadata.artworkUri) {
+        displayedCurrentTrack.mediaMetadata.artworkUri?.toString() ?: ""
+    }
+    var pendingSlideInKey by remember { mutableStateOf<Any?>(null) }
+    if (swipeDirection != null) {
+        pendingSlideInKey = currentTrack.mediaId
+    }
+    LaunchedEffect(pendingSlideInKey) {
+        if (pendingSlideInKey != null) {
+            animate(swipeState.offsetX, 0f, 0f, motion.spec(SwipeCoverSpringSpec)) { value, _ ->
+                swipeState.offsetX = value
+            }
+        }
+    }
+
+    // 图标显示做一层去抖：暂停状态维持不到 400ms 就又变回播放的话，不体现在图标上
+    var displayedIsPlaying by remember { mutableStateOf(isPlaying) }
+    LaunchedEffect(isPlaying) {
+        if (!isPlaying) {
+            delay(400)
+        }
+        displayedIsPlaying = isPlaying
+    }
+
+    val miniPlayerCornerRadius = 8.dp
+    val miniPlayerShape = RoundedCornerShape(miniPlayerCornerRadius)
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            // 弥散阴影让卡片从纯黑背景上浮起来，避免边缘跟背景生硬贴死
+            .shadow(
+                elevation = 16.dp,
+                shape = miniPlayerShape,
+                ambientColor = Color.Black.copy(alpha = 0.4f),
+                spotColor = Color.Black.copy(alpha = 0.4f)
+            )
+            .clip(miniPlayerShape)
+            .border(0.5.dp, ContentPrimary.copy(alpha = if (expanded) 0.14f else 0.08f), miniPlayerShape)
+            .draggable(
+                orientation = Orientation.Vertical,
+                state = rememberDraggableState { delta ->
+                    onDrag?.invoke(delta)
+                },
+                onDragStopped = { velocity ->
+                    onDragEnd?.invoke(velocity)
+                }
+            )
+            .then(
+                rememberSwipeToSkipDragModifier(
+                    state = swipeState,
+                    canSwipeToPrevious = canSwipeToPrevious,
+                    canSwipeToNext = canSwipeToNext,
+                    onConfirmPrevious = onPrevious,
+                    onConfirmNext = onNext,
+                    onCancelPending = onCancelPendingSkip
+                )
+            )
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(fillColor)
+        )
+        Column {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = 12.dp,
+                        end = 6.dp,
+                        top = if (expanded) 10.dp else 6.dp,
+                        bottom = if (expanded) 10.dp else 6.dp
+                    )
+            ) {
+                // 封面+歌名歌手整体跟手平移，播放/下一首按钮不参与滑动
+                val connectedDevice = rememberCurrentOutputDevice()
+                MiniPlayerSlidingContent(
+                    state = swipeState,
+                    currentKey = displayedCurrentTrack.mediaId,
+                    currentTitle = displayedCurrentTrack.mediaMetadata.title?.toString() ?: "未知歌名",
+                    currentArtist = displayedCurrentTrack.mediaMetadata.artist?.toString().orEmpty(),
+                    currentCoverUrl = displayedCleanCoverUrl,
+                    previousQueueItem = displayedPreviousQueueItem,
+                    nextQueueItem = displayedNextQueueItem,
+                    connectedDevice = connectedDevice,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(if (expanded) 52.dp else 44.dp)
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy((-2).dp)) {
+                    // 歌曲：带圈图标弹出选歌单面板，已在喜欢中时着主色显示对勾；播客：♡ 直接订阅电台
+                    if (likeMode != MiniPlayerLikeMode.Hidden) {
+                        val subscribe = likeMode == MiniPlayerLikeMode.Subscribe
+                        MelodiaIconButton(onClick = onLikeClick) {
+                            Icon(
+                                imageVector = when {
+                                    subscribe -> if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder
+                                    isLiked -> Icons.Rounded.CheckCircle
+                                    else -> Icons.Rounded.AddCircleOutline
+                                },
+                                contentDescription = if (subscribe) "订阅电台" else if (isLiked) "已收藏到歌单" else "收藏到歌单",
+                                tint = if (isLiked) MaterialTheme.colorScheme.primary else ContentPrimary,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                    }
+                    // 播放/暂停按钮
+                    MelodiaIconButton(onClick = onTogglePlay, style = MelodiaPress.Transport) {
+                        PlayPauseIcon(displayedIsPlaying, ContentPrimary, contentDescription = "播放/暂停")
+                    }
+                    // 下一首按钮
+                    MelodiaIconButton(onClick = onNext) {
+                        Icon(
+                            imageVector = Icons.Rounded.SkipNext,
+                            contentDescription = "下一首",
+                            tint = ContentPrimary,
+                            modifier = Modifier.size(28.dp)
+                        )
+                    }
+                }
+            }
+            
+            // 底部进度条：自圆角曲线与平直直线交点开始和结束
+            MiniPlayerProgress(
+                currentPositionProvider = currentPositionProvider,
+                duration = duration,
+                modifier = Modifier.padding(horizontal = miniPlayerCornerRadius)
+            )
+        }
+    }
+}
+
+// 单层的展示数据 + 位置：按 key驱动 Compose 复用，见 MiniPlayerSlidingContent 顶部注释
+private class MiniPlayerSlideLayer(
+    val key: Any,
+    val title: String,
+    val artist: String,
+    val coverUrl: String,
+    val connectedDevice: AudioDeviceInfo?,
+    val translationXProvider: () -> Float
+)
+
+// 封面+歌名歌手整体的跟手平移容器：当前/上一首/下一首三层叠放，靠 state.offsetX 联动。
+@Composable
+private fun MiniPlayerSlidingContent(
+    state: SwipeToSkipCoverState,
+    currentKey: Any,
+    currentTitle: String,
+    currentArtist: String,
+    currentCoverUrl: String,
+    previousQueueItem: QueueItem?,
+    nextQueueItem: QueueItem?,
+    connectedDevice: AudioDeviceInfo?,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .clipToBounds()
+            .onSizeChanged { state.containerWidthPx = it.width.toFloat() }
+    ) {
+        val shouldShowNeighbors = state.isDragActive || state.isTransitioning || state.offsetX != 0f
+        val layers = buildList {
+            if (shouldShowNeighbors) {
+                previousQueueItem?.let { item ->
+                    add(
+                        MiniPlayerSlideLayer(
+                            // QueueItem.songId 是 Long，currentKey（mediaId）是 String，
+                            // 统一转成 String 才能在角色切换（下一首→当前）时被 Compose 判定为同一个 key
+                            key = item.songId.toString(),
+                            title = item.title,
+                            artist = item.artist,
+                            coverUrl = rememberQueueItemCoverUrl(item.coverUrl, item.songId, item.localUri),
+                            connectedDevice = null,
+                            translationXProvider = { state.offsetX - state.containerWidthPx }
+                        )
+                    )
+                }
+            }
+            add(
+                MiniPlayerSlideLayer(
+                    key = currentKey,
+                    title = currentTitle,
+                    artist = currentArtist,
+                    coverUrl = currentCoverUrl,
+                    connectedDevice = connectedDevice,
+                    translationXProvider = { state.offsetX }
+                )
+            )
+            if (shouldShowNeighbors) {
+                nextQueueItem?.let { item ->
+                    add(
+                        MiniPlayerSlideLayer(
+                            // 队列只有两首歌时上一首/下一首指向同一首曲目，key 会撞上前面那层，加个后缀区分开；
+                            // 统一转成 String 才能在角色切换（下一首→当前）时被 Compose 判定为同一个 key
+                            key = if (item.songId == previousQueueItem?.songId) "${item.songId}-next" else item.songId.toString(),
+                            title = item.title,
+                            artist = item.artist,
+                            coverUrl = rememberQueueItemCoverUrl(item.coverUrl, item.songId, item.localUri),
+                            connectedDevice = null,
+                            translationXProvider = { state.offsetX + state.containerWidthPx }
+                        )
+                    )
+                }
+            }
+        }
+        layers.forEach { layer ->
+            key(layer.key) {
+                MiniPlayerContentRow(
+                    title = layer.title,
+                    artist = layer.artist,
+                    coverUrl = layer.coverUrl,
+                    connectedDevice = layer.connectedDevice,
+                    translationXProvider = layer.translationXProvider
+                )
+            }
+        }
+    }
+}
+
+// 单层：封面 + 歌名/歌手
+@Composable
+private fun MiniPlayerContentRow(
+    title: String,
+    artist: String,
+    coverUrl: String,
+    connectedDevice: AudioDeviceInfo?,
+    translationXProvider: () -> Float
+) {
+    val thumbUrl = remember(coverUrl) {
+        if ((coverUrl.startsWith("http://") || coverUrl.startsWith("https://")) && !coverUrl.contains('?')) {
+            "$coverUrl?param=150y150"
+        } else {
+            coverUrl
+        }
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer { translationX = translationXProvider() }
+    ) {
+        AntiFlickerCoverImage(
+            url = thumbUrl,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(RadiusCompact))
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.Center
+        ) {
+            val titleLine = if (connectedDevice != null && artist.isNotBlank()) "$title · $artist" else title
+            Text(
+                text = titleLine,
+                color = ContentPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = TextStyle(
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
+                    lineHeight = 16.sp
+                ),
+                modifier = Modifier.basicMarquee()
+            )
+            if (connectedDevice != null) {
+                Spacer(modifier = Modifier.height(1.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = deviceIcon(connectedDevice.type),
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = deviceLabel(connectedDevice),
+                        color = MaterialTheme.colorScheme.primary,
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = TextStyle(
+                            platformStyle = PlatformTextStyle(includeFontPadding = false),
+                            lineHeight = 13.sp
+                        )
+                    )
+                }
+            } else if (artist.isNotBlank()) {
+                Spacer(modifier = Modifier.height(1.dp))
+                Text(
+                    text = artist,
+                    color = ContentPrimary.copy(alpha = 0.75f),
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = TextStyle(
+                        platformStyle = PlatformTextStyle(includeFontPadding = false),
+                        lineHeight = 14.sp
+                    )
+                )
+            }
+        }
+    }
+}
+
+// 进度条组件
+@Composable
+fun MiniPlayerProgress(
+    currentPositionProvider: () -> Long,
+    duration: Long,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(2.dp)
+            .clip(CircleShape)
+            .background(ContentPrimary.copy(alpha = 0.08f))
+    ) {
+        val currentPosition = currentPositionProvider()
+        val progress = if (duration > 0) currentPosition.toFloat() / duration else 0f
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(progress.coerceIn(0f, 1f))
+                .fillMaxHeight()
+                .clip(CircleShape)
+                .background(ContentPrimary.copy(alpha = 0.85f))
+        )
+    }
+}
+
+//底部导航栏。expanded=true 时用于平板宽屏下的独立悬浮卡片（圆角、不贴屏幕边缘），
+//expanded=false 时是手机上贴底通栏的现状实现
+@Composable
+fun MelodiaNavigationBar(
+    currentScreen: Screen,
+    onNavigate: (Screen) -> Unit,
+    onCreateClick: () -> Unit,
+    isCreateMenuOpen: Boolean,
+    showCreateEntry: Boolean = true,
+    bottomBarLayout: List<BottomBarItemSetting> = BottomBarLayout.DEFAULT,
+    iconOnly: Boolean = false,
+    activeTab: Screen? = null,
+    expanded: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    // 平板宽屏下用 SurfaceDark（比页面背景 BackgroundDark 亮一档）+ 描边，
+    // 避免和几乎所有页面都在用的 BackgroundDark 背景融为一体
+    Surface(
+        color = if (expanded) SurfaceDark else BackgroundDark,
+        shape = if (expanded) RoundedCornerShape(InfoCardRadius) else RectangleShape,
+        modifier = modifier
+            .fillMaxWidth()
+            .then(
+                if (expanded) {
+                    Modifier
+                        .fillMaxHeight()
+                        .border(0.5.dp, ContentPrimary.copy(alpha = 0.14f), RoundedCornerShape(InfoCardRadius))
+                } else {
+                    Modifier
+                }
+            )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (expanded) {
+                        Modifier.fillMaxHeight()
+                    } else {
+                        Modifier.navigationBarsPadding().height(60.dp)
+                    }
+                )
+                .padding(
+                    top = if (iconOnly) 4.dp else 12.dp,
+                    bottom = if (iconOnly) 4.dp else 2.dp
+                ),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val effectiveLayout = if (!showCreateEntry && bottomBarLayout == BottomBarLayout.DEFAULT) {
+                bottomBarLayout.map {
+                    if (it.item == BottomBarItem.CREATE) it.copy(visible = false) else it
+                }
+            } else {
+                bottomBarLayout
+            }
+
+            val navItems = effectiveLayout.filter { it.visible }.map { setting ->
+                when (setting.item) {
+                    BottomBarItem.HOME -> Triple("主页", Icons.Default.Home, Screen.Home)
+                    BottomBarItem.SEARCH -> Triple("搜索", Icons.Default.Search, Screen.Search)
+                    BottomBarItem.LIBRARY -> Triple("音乐库", Icons.Default.LibraryMusic, Screen.Library)
+                    BottomBarItem.CREATE -> Triple("创建", if (isCreateMenuOpen) Icons.Rounded.Close else Icons.Default.AddBox, null)
+                    BottomBarItem.LOCAL_MUSIC -> Triple("本地音乐", Icons.Default.Folder, Screen.LocalMusic)
+                    BottomBarItem.DOWNLOADS -> Triple("下载管理", Icons.Outlined.FileDownload, Screen.Downloads)
+                    BottomBarItem.CLOUD -> Triple("我的云盘", Icons.Outlined.CloudQueue, Screen.Cloud)
+                    BottomBarItem.PROFILE -> Triple("个人主页", Icons.Default.Person, Screen.MyProfile)
+                }
+            }
+
+            navItems.forEach { (label, icon, targetScreen) ->
+                val isSelected = targetScreen != null && (activeTab?.let { it == targetScreen } ?: (currentScreen == targetScreen))
+                
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .pressable(MelodiaPress.Tab) {
+                            if (targetScreen != null) {
+                                onNavigate(targetScreen)
+                            } else {
+                                onCreateClick()
+                            }
+                        },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    // 药丸形状背景
+                    Box(
+                        modifier = Modifier
+                            .clip(styledCorners(16.dp))
+                            .background(if (isSelected) NavPillSelected else Color.Transparent)
+                            .padding(
+                                horizontal = MelodiaSpacing.md,
+                                vertical = if (iconOnly) 6.dp else 1.dp
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = label,
+                            tint = if (isSelected) ContentPrimary else TextGray,
+                            modifier = Modifier.size(if (iconOnly) 24.dp else 22.dp)
+                        )
+                    }
+                    if (!iconOnly) {
+                        Text(
+                            text = label,
+                            color = if (isSelected) ContentPrimary else TextGray,
+                            fontSize = 11.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
