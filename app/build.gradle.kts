@@ -47,6 +47,12 @@ android {
         versionName = (project.findProperty("releaseVersionName") as String?) ?: "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // 手机和方屏手表都是 arm64：只打这一个 ABI，安装包能从 100MB+ 掉到 40MB 上下，
+        // 手表上走蓝牙/小水管下载也不至于等太久
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     signingConfigs {

@@ -40,6 +40,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -185,7 +186,10 @@ fun MelodiaApp() {
 
     val playerSheet = rememberMelodiaPlayerSheetState()
     val navigation = rememberMelodiaNavigationState()
-    val sidebar = rememberMelodiaSidebarState(SidebarWidth)
+    // 方屏手表：底栏只留图标、不提供创建菜单入口；侧栏按屏宽铺满，310dp 会超出 200dp 的屏幕
+    val watchMode = LocalMelodiaWatchMode.current
+    val sidebarWidth = if (watchMode) LocalConfiguration.current.screenWidthDp.dp else SidebarWidth
+    val sidebar = rememberMelodiaSidebarState(sidebarWidth)
 
     // 动态同步底栏首个可用路由为首选根 Tab
     LaunchedEffect(bottomBarLayout) {
@@ -259,8 +263,6 @@ fun MelodiaApp() {
     val miniPlayerSuppressor = remember { MiniPlayerSuppressor() }
     // 平板适配断点，顶层下发供 MelodiaBottomOverlay 及后续各阶段消费
     val windowSizeClass = rememberMelodiaWindowSizeClass()
-    // 方屏手表：底栏只留图标、不提供创建菜单入口
-    val watchMode = LocalMelodiaWatchMode.current
     // 方向维度，与宽度断点独立组合
     val orientationClass = rememberMelodiaOrientationClass()
     // Expanded 断点下播放器是否展开为常驻侧栏面板；与手机端 playerSheet 完全独立的状态机。
@@ -435,7 +437,7 @@ fun MelodiaApp() {
         userProfile?.let { profile ->
             Box(
                 modifier = Modifier
-                    .width(SidebarWidth)
+                    .width(sidebarWidth)
                     .fillMaxHeight()
                     .graphicsLayer {
                         translationX = sidebar.offsetX - sidebar.widthPx
