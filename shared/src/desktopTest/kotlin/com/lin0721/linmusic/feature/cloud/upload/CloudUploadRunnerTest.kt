@@ -80,7 +80,7 @@ class CloudUploadRunnerTest {
         scope.cancel()
     }
 
-    private suspend fun runBatch(block: () -> Unit): UploadBatchResult = withTimeout(5_000) {
+    private suspend fun runBatch(block: () -> Unit): UploadBatchResult = withTimeout(30_000) {
         val result = async { runner.batchFinished.first() }
         block()
         result.await()

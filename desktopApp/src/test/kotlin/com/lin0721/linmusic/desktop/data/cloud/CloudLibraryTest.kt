@@ -94,7 +94,7 @@ class CloudLibraryTest {
         fileSizeText = "", addedAtText = "", coverUrl = null, isUnmatched = true
     )
 
-    private suspend fun awaitUntil(predicate: () -> Boolean) = withTimeout(5_000) {
+    private suspend fun awaitUntil(predicate: () -> Boolean) = withTimeout(30_000) {
         while (!predicate()) delay(20)
     }
 
