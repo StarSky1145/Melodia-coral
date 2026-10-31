@@ -104,6 +104,9 @@ fun LoginBottomSheet(
     val smsDriver = remember { AndroidSmsWebDriver(context) }
     val smsWebDriver: SmsWebDriver? = remember(smsDriver) { if (smsDriver.available) smsDriver else null }
 
+    // 面板一打开就预热隐藏页面，用户点「获取验证码」时多半已经加载好了
+    LaunchedEffect(smsDriver) { smsDriver.prepare() }
+
     // 弹窗整体离开组合时兜底停止轮询，覆盖点击遮罩/手势关闭等未经返回按钮的路径
     DisposableEffect(Unit) {
         onDispose {

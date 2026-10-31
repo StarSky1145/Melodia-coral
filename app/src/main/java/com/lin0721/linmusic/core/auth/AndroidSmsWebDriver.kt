@@ -18,22 +18,30 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebViewClient
 import com.lin0721.linmusic.core.log.AppLogger
 import com.lin0721.linmusic.core.network.AppError
 import com.lin0721.linmusic.core.network.NeteaseEndpoints
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.util.Locale
 
 private const val TAG = "SmsWebDriver"
 
 // 登录页是纯前端 SPA（首屏 HTML 里一个 input 都没有），WebView 下完几 MB 的 chunk 才渲染出表单
-private const val PAGE_LOAD_TIMEOUT_MS = 25_000L
-private const val SEND_TIMEOUT_MS = 25_000L
+private const val PAGE_LOAD_TIMEOUT_MS = 45_000L
+private const val SEND_TIMEOUT_MS = 60_000L
 // 需要用户拖滑块时给足时间，别在验证过程中判超时
 private const val CAPTCHA_TIMEOUT_MS = 120_000L
 private const val LOGIN_TIMEOUT_MS = 30_000L
 private const val COOKIE_POLL_MS = 800L
 private const val HOST_URL = "https://${NeteaseEndpoints.WEB_HOST}"
+
+// 这些后缀的资源一律不下载（图片/字体/音视频），登录页靠 JS 渲染，不影响功能
+private val BLOCK_EXT = listOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".otf", ".mp3", ".mp4", ".m4a")
 
 // 与 WebViewLoginScreen 一致的净化 UA：页面本身会按 UA 走移动端分支
 private const val WEB_UA =
@@ -118,7 +126,7 @@ private const val DRIVER_JS = """
   var tries = 0;
   function retry() {
     tries++;
-    if (tries > 40) { report("fail", "没能在网页登录页找到手机号输入框"); return; }
+    if (tries > 90) { report("noinput", ""); return; }
     setTimeout(walk, 500);
   }
   function walk() {
@@ -267,6 +275,21 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     private var lastCode = ""
     private val timeouts = mutableListOf<Runnable>()
 
+    private var progressSeconds = 0
+    private val progressTicker = object : Runnable {
+        override fun run() {
+            if (sendCallback == null) return
+            progressSeconds += 3
+            val text = if (presented) {
+                "网易要求人机验证，请拖一下滑块"
+            } else {
+                "正在打开网易登录页… ${progressSeconds}s"
+            }
+            sendProgress?.invoke(text)
+            main.postDelayed(this, 3_000)
+        }
+    }
+
     private val loginPoller = object : Runnable {
         override fun run() {
             if (!loginPolling) return
@@ -282,6 +305,11 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     /** 没有 Activity 就拿不到窗口 token，Dialog 建不起来，调用方需要退回纯接口登录 */
     val available: Boolean = activity != null
 
+    /** 登录面板一弹出就调用：提前把隐藏页面加载好，点「获取验证码」时就不用干等 */
+    fun prepare() {
+        main.post { ensurePage() }
+    }
+
     override fun sendCode(phone: String, onProgress: (String) -> Unit, onResult: (Result<Unit>) -> Unit) {
         main.post {
             if (!ensurePage()) {
@@ -291,8 +319,11 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             settlePendingCallbacks()
             sendCallback = onResult
             sendProgress = onProgress
-            onProgress("正在打开网易登录页…")
-            schedule(SEND_TIMEOUT_MS) { failSend("网页登录页没有响应，请改用网页登录") }
+            onProgress(if (pageReady) "正在填写手机号…" else "正在打开网易登录页… 0s")
+            progressSeconds = 0
+            main.removeCallbacks(progressTicker)
+            main.postDelayed(progressTicker, 3_000)
+            schedule(SEND_TIMEOUT_MS) { failSend("网易登录页一直没响应，可以点下面的「改用网页登录」自己操作") }
             inject(DRIVER_JS.replace("__PHONE__", phone))
         }
     }
@@ -451,6 +482,27 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             addJavascriptInterface(Bridge(), "MELODIA_BRIDGE")
             webChromeClient = WebChromeClient()
             webViewClient = object : WebViewClient() {
+                // 登录页里图片/字体/视频只占带宽，全拦掉，脚本和接口照常走
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): WebResourceResponse? {
+                    val dest = request.requestHeaders["Accept"] ?: ""
+                    val path = request.url.toString().lowercase(Locale.US)
+                    val block = dest.startsWith("image/") ||
+                        BLOCK_EXT.any { path.contains(it) }
+                    return if (block) {
+                        WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    } else {
+                        null
+                    }
+                }
+
+                override fun onPageCommitVisible(view: WebView?, url: String?) {
+                    // 首屏 DOM 一可见就先塞工具函数，别等 onPageFinished
+                    evaluate(PRELUDE_JS)
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
                     pageReady = true
                     evaluate(PRELUDE_JS)
@@ -535,6 +587,20 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
                 hideWindow()
                 if (sendCallback != null) finishSend(Result.success(Unit))
             }
+            "noinput" -> {
+                // 页面结构没认出输入框：别报错了，直接把窗口交给用户手动点
+                if (sendCallback != null) {
+                    cancelTimeouts()
+                    showWindow()
+                    sendProgress?.invoke("自动填写失败，请在窗口里点「获取验证码」")
+                    evaluate(WATCHER_JS)
+                    schedule(CAPTCHA_TIMEOUT_MS) {
+                        failSend("没有收到网易的验证码反馈，请重试或改用网页登录")
+                    }
+                } else {
+                    hideWindow()
+                }
+            }
             "fail" -> {
                 hideWindow()
                 val text = message.ifBlank { "网页登录页操作失败，请改用网页登录" }
@@ -574,6 +640,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
         val cb = sendCallback ?: return
         sendCallback = null
         sendProgress = null
+        main.removeCallbacks(progressTicker)
         hideWindow()
         cb(result)
     }
@@ -597,6 +664,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     // 上一轮没回调就再来一次时，先把旧的失败掉，保证每次调用都只回调一次
     private fun settlePendingCallbacks(reason: String = "上一次操作已被新的请求替换") {
         cancelTimeouts()
+        main.removeCallbacks(progressTicker)
         sendCallback?.let { cb ->
             sendCallback = null
             sendProgress = null
