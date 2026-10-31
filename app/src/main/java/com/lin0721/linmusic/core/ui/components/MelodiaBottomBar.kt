@@ -57,6 +57,7 @@ import com.lin0721.linmusic.Screen
 import com.lin0721.linmusic.core.player.QueueItem
 import com.lin0721.linmusic.core.player.rememberQueueItemCoverUrl
 import com.lin0721.linmusic.core.ui.interaction.pressable
+import com.lin0721.linmusic.core.ui.theme.LocalMelodiaWatchMode
 import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
 import com.lin0721.linmusic.core.ui.theme.MelodiaPress
 import com.lin0721.linmusic.core.ui.theme.BackgroundDark
@@ -112,6 +113,8 @@ fun MiniPlayerCard(
     expanded: Boolean = false
 ) {
     val motion = LocalUiMotion.current
+    // 方屏手表：封面和按钮都收一档，整条不高于 48dp，避免和底栏一起把 200dp 高的屏吃掉
+    val watchMode = LocalMelodiaWatchMode.current
     if (currentTrack == null) return
 
     val context = LocalContext.current
@@ -234,10 +237,10 @@ fun MiniPlayerCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(
-                        start = 12.dp,
-                        end = 6.dp,
-                        top = if (expanded) 10.dp else 6.dp,
-                        bottom = if (expanded) 10.dp else 6.dp
+                        start = if (watchMode) 8.dp else 12.dp,
+                        end = if (watchMode) 2.dp else 6.dp,
+                        top = if (watchMode) 4.dp else if (expanded) 10.dp else 6.dp,
+                        bottom = if (watchMode) 4.dp else if (expanded) 10.dp else 6.dp
                     )
             ) {
                 // 封面+歌名歌手整体跟手平移，播放/下一首按钮不参与滑动
@@ -253,12 +256,12 @@ fun MiniPlayerCard(
                     connectedDevice = connectedDevice,
                     modifier = Modifier
                         .weight(1f)
-                        .height(if (expanded) 52.dp else 44.dp)
+                        .height(if (watchMode) 36.dp else if (expanded) 52.dp else 44.dp)
                 )
 
                 Row(horizontalArrangement = Arrangement.spacedBy((-2).dp)) {
                     // 歌曲：带圈图标弹出选歌单面板，已在喜欢中时着主色显示对勾；播客：♡ 直接订阅电台
-                    if (likeMode != MiniPlayerLikeMode.Hidden) {
+                    if (likeMode != MiniPlayerLikeMode.Hidden && !watchMode) {
                         val subscribe = likeMode == MiniPlayerLikeMode.Subscribe
                         MelodiaIconButton(onClick = onLikeClick) {
                             Icon(
@@ -408,14 +411,15 @@ private fun MiniPlayerContentRow(
             .fillMaxSize()
             .graphicsLayer { translationX = translationXProvider() }
     ) {
+        val watchMode = LocalMelodiaWatchMode.current
         AntiFlickerCoverImage(
             url = thumbUrl,
             contentScale = ContentScale.Crop,
             modifier = Modifier
-                .size(44.dp)
+                .size(if (watchMode) 32.dp else 44.dp)
                 .clip(RoundedCornerShape(RadiusCompact))
         )
-        Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(if (watchMode) 8.dp else 12.dp))
         Column(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.Center
@@ -515,6 +519,9 @@ fun MelodiaNavigationBar(
     expanded: Boolean = false,
     modifier: Modifier = Modifier
 ) {
+    // 方屏手表：标签放不下，强制图标模式，并只保留前 4 个入口
+    val watchMode = LocalMelodiaWatchMode.current
+    val effectiveIconOnly = iconOnly || watchMode
     // 平板宽屏下用 SurfaceDark（比页面背景 BackgroundDark 亮一档）+ 描边，
     // 避免和几乎所有页面都在用的 BackgroundDark 背景融为一体
     Surface(
@@ -539,12 +546,12 @@ fun MelodiaNavigationBar(
                     if (expanded) {
                         Modifier.fillMaxHeight()
                     } else {
-                        Modifier.navigationBarsPadding().height(60.dp)
+                        Modifier.navigationBarsPadding().height(if (watchMode) 46.dp else 60.dp)
                     }
                 )
                 .padding(
-                    top = if (iconOnly) 4.dp else 12.dp,
-                    bottom = if (iconOnly) 4.dp else 2.dp
+                    top = if (effectiveIconOnly) 4.dp else 12.dp,
+                    bottom = if (effectiveIconOnly) 4.dp else 2.dp
                 ),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -569,7 +576,8 @@ fun MelodiaNavigationBar(
                 }
             }
 
-            navItems.forEach { (label, icon, targetScreen) ->
+            val visibleItems = if (watchMode) navItems.take(4) else navItems
+            visibleItems.forEach { (label, icon, targetScreen) ->
                 val isSelected = targetScreen != null && (activeTab?.let { it == targetScreen } ?: (currentScreen == targetScreen))
                 
                 Column(
@@ -591,8 +599,8 @@ fun MelodiaNavigationBar(
                             .clip(styledCorners(16.dp))
                             .background(if (isSelected) NavPillSelected else Color.Transparent)
                             .padding(
-                                horizontal = MelodiaSpacing.md,
-                                vertical = if (iconOnly) 6.dp else 1.dp
+                                horizontal = if (watchMode) MelodiaSpacing.sm else MelodiaSpacing.md,
+                                vertical = if (effectiveIconOnly) 6.dp else 1.dp
                             ),
                         contentAlignment = Alignment.Center
                     ) {
@@ -600,10 +608,10 @@ fun MelodiaNavigationBar(
                             imageVector = icon,
                             contentDescription = label,
                             tint = if (isSelected) ContentPrimary else TextGray,
-                            modifier = Modifier.size(if (iconOnly) 24.dp else 22.dp)
+                            modifier = Modifier.size(if (effectiveIconOnly) 24.dp else 22.dp)
                         )
                     }
-                    if (!iconOnly) {
+                    if (!effectiveIconOnly) {
                         Text(
                             text = label,
                             color = if (isSelected) ContentPrimary else TextGray,

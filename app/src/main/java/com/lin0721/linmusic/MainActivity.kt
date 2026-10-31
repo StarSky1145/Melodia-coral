@@ -30,10 +30,14 @@ import com.lin0721.linmusic.core.player.floatinglyric.FloatingLyricRequests
 import com.lin0721.linmusic.core.preferences.SettingsPreferences
 import com.lin0721.linmusic.core.preferences.UiScale
 import com.lin0721.linmusic.core.ui.theme.AppStyle
+import com.lin0721.linmusic.core.ui.theme.LocalMelodiaWatchMode
 import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
 import com.lin0721.linmusic.core.ui.theme.MelodiaStyleState
 import com.lin0721.linmusic.core.ui.theme.MelodiaTheme
 import com.lin0721.linmusic.core.ui.theme.UiMotion
+import com.lin0721.linmusic.core.ui.theme.WATCH_UI_SCALE_PERCENT
+import com.lin0721.linmusic.core.ui.theme.isWatchSize
+import com.lin0721.linmusic.core.ui.theme.rememberMelodiaWatchMode
 import com.lin0721.linmusic.core.ui.theme.scaledBy
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
@@ -55,15 +59,26 @@ class MainActivity : ComponentActivity() {
     // 本次创建时已应用的缩放百分比；偏好里的值与它不一致就重建界面
     private var appliedUiScalePercent = UiScale.DEFAULT_PERCENT
 
+    // 偏好里存着的缩放值。手表会自动叠一层默认缩放，重建判定必须比"用户设定值"，
+    // 否则 100 的设定值和 80 的实际值会来回触发 recreate
+    private var storedUiScalePercent = UiScale.DEFAULT_PERCENT
+
     // 本次创建时已应用的界面风格；偏好里的值与它不一致就重建界面
     private var appliedStyle = AppStyle.DEFAULT
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(newBase)
         // Activity 创建时 Koin 已由 Application 启动；读取失败按不缩放处理
-        appliedUiScalePercent = runCatching {
+        storedUiScalePercent = runCatching {
             runBlocking { GlobalContext.get().get<SettingsPreferences>().uiScalePercent.first() }
         }.getOrDefault(UiScale.DEFAULT_PERCENT)
+        appliedUiScalePercent = storedUiScalePercent
+        // 方屏手表：用户没动过缩放时套用 80%，手机排布才塞得进 200dp 见方
+        if (appliedUiScalePercent == UiScale.DEFAULT_PERCENT &&
+            newBase.resources.configuration.isWatchSize()
+        ) {
+            appliedUiScalePercent = WATCH_UI_SCALE_PERCENT
+        }
         val factor = UiScale.toFactor(appliedUiScalePercent)
         if (factor != 1f) applyOverrideConfiguration(newBase.resources.configuration.scaledBy(factor))
     }
@@ -71,7 +86,7 @@ class MainActivity : ComponentActivity() {
     // 覆盖配置里的 dp 尺寸是创建时的快照，旋转等配置变化后会过期，重建以按新配置重新换算
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        if (appliedUiScalePercent != UiScale.DEFAULT_PERCENT) recreate()
+        if (storedUiScalePercent != UiScale.DEFAULT_PERCENT) recreate()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -117,7 +132,7 @@ class MainActivity : ComponentActivity() {
         // 设置页松手后写入新缩放，重建界面让它落到 Activity 配置上
         lifecycleScope.launch {
             settingsPreferences.uiScalePercent.collect { percent ->
-                if (percent != appliedUiScalePercent) recreate()
+                if (percent != storedUiScalePercent) recreate()
             }
         }
 
@@ -125,7 +140,11 @@ class MainActivity : ComponentActivity() {
             val uiAnimationsEnabled by settingsPreferences.uiAnimationsEnabled.collectAsState(initial = true)
             val uiMotion = remember { UiMotion() }
             LaunchedEffect(uiAnimationsEnabled) { uiMotion.enabled = uiAnimationsEnabled }
-            CompositionLocalProvider(LocalUiMotion provides uiMotion) {
+            val watchMode = rememberMelodiaWatchMode()
+            CompositionLocalProvider(
+                LocalUiMotion provides uiMotion,
+                LocalMelodiaWatchMode provides watchMode
+            ) {
                 MelodiaTheme {
                     MelodiaApp()
                 }

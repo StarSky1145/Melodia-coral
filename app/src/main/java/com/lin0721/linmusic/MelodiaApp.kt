@@ -67,6 +67,7 @@ import com.lin0721.linmusic.core.ui.components.PlaylistCollectSheet
 import com.lin0721.linmusic.core.ui.components.ProfileSidebar
 import com.lin0721.linmusic.core.ui.components.ToastManager
 import com.lin0721.linmusic.core.ui.interaction.pressable
+import com.lin0721.linmusic.core.ui.theme.LocalMelodiaWatchMode
 import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
 import com.lin0721.linmusic.core.ui.theme.ScreenSlideDurationMs
 import com.lin0721.linmusic.core.ui.components.MiniPlayerCard
@@ -258,6 +259,8 @@ fun MelodiaApp() {
     val miniPlayerSuppressor = remember { MiniPlayerSuppressor() }
     // 平板适配断点，顶层下发供 MelodiaBottomOverlay 及后续各阶段消费
     val windowSizeClass = rememberMelodiaWindowSizeClass()
+    // 方屏手表：底栏只留图标、不提供创建菜单入口
+    val watchMode = LocalMelodiaWatchMode.current
     // 方向维度，与宽度断点独立组合
     val orientationClass = rememberMelodiaOrientationClass()
     // Expanded 断点下播放器是否展开为常驻侧栏面板；与手机端 playerSheet 完全独立的状态机。
@@ -588,7 +591,7 @@ fun MelodiaApp() {
                                 }
                             },
                             onCreateClick = { showCreateSheet = !showCreateSheet },
-                            showCreateEntry = showCreateEntry,
+                            showCreateEntry = showCreateEntry && !watchMode,
                             bottomBarLayout = bottomBarLayout,
                             bottomBarIconOnly = bottomBarIconOnly,
                             activeTab = navigation.activeTab,
