@@ -719,6 +719,8 @@ fun MelodiaApp() {
             duration = duration,
             onTogglePlay = { viewModel.togglePlayPause() },
             onSeek = { viewModel.playerManager.seekTo(it) },
+            onPrevious = { viewModel.playerManager.skipToPrevious() },
+            onNext = { viewModel.playerManager.playNext() },
             onClose = {
                 navigation.resetPlayerNavigation()
                 playerSheet.animateTo(false, 0f)

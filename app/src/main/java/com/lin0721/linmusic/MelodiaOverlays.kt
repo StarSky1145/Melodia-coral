@@ -42,11 +42,13 @@ import com.lin0721.linmusic.core.ui.theme.uiExit
 import com.lin0721.linmusic.core.ui.theme.uiTween
 import com.lin0721.linmusic.feature.create.ui.CreatePopupMenu
 import com.lin0721.linmusic.feature.player.ui.FullPlayerScreen
+import com.lin0721.linmusic.feature.player.ui.WatchPlayerScreen
 import com.lin0721.linmusic.feature.settings.ui.UpdateBanner
 import dev.chrisbanes.haze.HazeState
 import com.lin0721.linmusic.core.preferences.BottomBarItemSetting
 import com.lin0721.linmusic.core.preferences.BottomBarLayout
 import com.lin0721.linmusic.core.ui.theme.MelodiaSpacing
+import com.lin0721.linmusic.core.ui.theme.LocalMelodiaWatchMode
 import com.lin0721.linmusic.core.ui.theme.LocalMelodiaWindowSizeClass
 import com.lin0721.linmusic.core.ui.theme.MelodiaWindowSizeClass
 import com.lin0721.linmusic.core.ui.theme.rememberMelodiaPlayerPanelWidth
@@ -335,6 +337,8 @@ fun MelodiaFullPlayerOverlay(
     duration: Long,
     onTogglePlay: () -> Unit,
     onSeek: (Long) -> Unit,
+    onPrevious: () -> Unit = {},
+    onNext: () -> Unit = {},
     onClose: () -> Unit,
     onDragClose: (Float, Float) -> Unit,
     onArtistClick: (Long) -> Unit,
@@ -361,6 +365,20 @@ fun MelodiaFullPlayerOverlay(
                     )
                 )
         ) {
+            // 方屏手表：手机版播放页一屏放不下，换成单屏紧凑版
+            if (LocalMelodiaWatchMode.current) {
+                WatchPlayerScreen(
+                    currentTrack = currentTrack,
+                    isPlaying = isPlaying,
+                    currentPositionProvider = currentPositionProvider,
+                    duration = duration,
+                    onTogglePlay = onTogglePlay,
+                    onSeek = onSeek,
+                    onPrevious = onPrevious,
+                    onNext = onNext,
+                    onClose = onClose
+                )
+            } else {
             FullPlayerScreen(
                 currentTrack = currentTrack,
                 isPlaying = isPlaying,
@@ -379,6 +397,7 @@ fun MelodiaFullPlayerOverlay(
                 onLyricsFullScreenChange = onLyricsFullScreenChange,
                 onLyricsControlsVisibilityChange = onLyricsControlsVisibilityChange
             )
+            }
         }
     }
 }
