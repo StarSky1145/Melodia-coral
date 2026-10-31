@@ -30,7 +30,8 @@ private const val SMS_RESEND_SECONDS = 60
 private const val SMS_CODE_LENGTH = 4
 // 网页登录驱动兜底超时：驱动自己的超时（发码 25s / 登录 30s）之外再加一层，
 // 保证「发送中…」不会无限转圈（驱动可能因为页面卡死、WebView 崩溃而一个回调都不给）
-private const val WEB_SEND_WATCHDOG_MS = 32_000L
+// 需要用户拖滑块时驱动会放宽到 120s，看门狗要比它更宽
+private const val WEB_SEND_WATCHDOG_MS = 150_000L
 private const val WEB_LOGIN_WATCHDOG_MS = 40_000L
 private const val WEB_SEND_TIMEOUT_HINT =
     "网易网页登录页没有响应，多半是要求人机验证。请点下方「改用网页登录」在官方页面完成登录"
@@ -61,6 +62,8 @@ data class SmsLoginState(
     // 当前这一轮验证码发往的手机号，用于提示
     val sentTo: String? = null,
     val loggingIn: Boolean = false,
+    // 发码/登录过程中的一句话提示（例如「网易要求人机验证，请拖一下滑块」）
+    val status: String? = null,
     val error: String? = null,
 )
 
@@ -188,19 +191,26 @@ class LoginViewModel(
             _smsState.update { it.copy(error = "请输入正确的手机号") }
             return
         }
-        _smsState.update { it.copy(sending = true, error = null) }
+        _smsState.update { it.copy(sending = true, error = null, status = null) }
         if (webDriver != null) {
             var finished = false
             // 回调约定在主线程，直接改状态即可
-            webDriver.sendCode(normalized) { result ->
+            webDriver.sendCode(
+                normalized,
+                onProgress = { text -> if (!finished) _smsState.update { it.copy(status = text) } }
+            ) { result ->
                 if (finished) return@sendCode
                 finished = true
                 if (result.isSuccess) {
-                    _smsState.update { it.copy(sending = false, sentTo = normalized) }
+                    _smsState.update { it.copy(sending = false, sentTo = normalized, status = null) }
                     startCountdown()
                 } else {
                     _smsState.update {
-                        it.copy(sending = false, error = smsErrorText(result.exceptionOrNull(), "验证码发送失败，请稍后重试"))
+                        it.copy(
+                            sending = false,
+                            status = null,
+                            error = smsErrorText(result.exceptionOrNull(), "验证码发送失败，请稍后重试")
+                        )
                     }
                 }
             }

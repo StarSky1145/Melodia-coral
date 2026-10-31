@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -25,11 +26,11 @@ import org.json.JSONObject
 
 private const val TAG = "SmsWebDriver"
 
-// 登录页是纯前端 SPA（首屏 HTML 里没有任何 input），WebView 要下完几 MB 的 chunk 才能渲染出表单，
-// 超时给太紧就会「进度条卡住然后失败」，给太松又会让人干等，所以这里留 25s，
-// 真正兜底的是 LoginViewModel 里的看门狗
+// 登录页是纯前端 SPA（首屏 HTML 里一个 input 都没有），WebView 下完几 MB 的 chunk 才渲染出表单
 private const val PAGE_LOAD_TIMEOUT_MS = 25_000L
 private const val SEND_TIMEOUT_MS = 25_000L
+// 需要用户拖滑块时给足时间，别在验证过程中判超时
+private const val CAPTCHA_TIMEOUT_MS = 120_000L
 private const val LOGIN_TIMEOUT_MS = 30_000L
 private const val COOKIE_POLL_MS = 800L
 private const val HOST_URL = "https://${NeteaseEndpoints.WEB_HOST}"
@@ -39,35 +40,56 @@ private const val WEB_UA =
     "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/112.0.0.0 Mobile Safari/537.36"
 
-// 驱动网页登录页填手机号/验证码并点按钮。
-// 页面是纯前端渲染的，DOM 结构和类名会随版本变，所以全部按「可见元素 + 文案/placeholder」模糊匹配，
-// 每一步都带重试；任何一步没对上都会回报 fail，由 Kotlin 侧转成可读提示。
-private const val DRIVER_JS = """
+// 页面里复用的小工具：可见性判断、按文案找按钮、检测行为验证浮层
+private const val PRELUDE_JS = """
 (function () {
-  var STEP = "__STEP__";
-  var PHONE = "__PHONE__";
-  var CODE = "__CODE__";
-  var bridge = window.MELODIA_BRIDGE;
-  function report(type, message) {
-    try { bridge && bridge.report(JSON.stringify({ type: type, message: message || "" })); } catch (e) {}
-  }
-  function visible(el) {
+  window.__melodiaReport = function (type, message) {
+    try {
+      window.MELODIA_BRIDGE.report(JSON.stringify({ type: type, message: message || "" }));
+    } catch (e) {}
+  };
+  window.__melodiaVisible = function (el) {
     if (!el) return false;
     var r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return false;
     var st = getComputedStyle(el);
     return st.display !== "none" && st.visibility !== "hidden" && parseFloat(st.opacity || "1") > 0.1;
-  }
-  function textOf(el) { return ((el.innerText || el.textContent || "") + "").trim(); }
-  function byText(re) {
+  };
+  window.__melodiaByText = function (re) {
     var list = document.querySelectorAll("a,button,div,span,p,i,label,em");
     for (var i = 0; i < list.length; i++) {
       var el = list[i];
-      var t = textOf(el);
-      if (t && t.length <= 20 && re.test(t) && visible(el)) return el;
+      var t = ((el.innerText || el.textContent || "") + "").trim();
+      if (t && t.length <= 20 && re.test(t) && window.__melodiaVisible(el)) return el;
     }
     return null;
-  }
+  };
+  window.__melodiaHasVerify = function () {
+    var sels = ["iframe[src*='verify']", "iframe[src*='encrypt-pages']", "iframe[src*='captcha']",
+                "[class*='yidun']", "#captcha", "[id*='captcha']", "#captcha-login-box"];
+    for (var i = 0; i < sels.length; i++) {
+      try {
+        var el = document.querySelector(sels[i]);
+        if (el && window.__melodiaVisible(el)) return el;
+      } catch (e) {}
+    }
+    var body = document.body ? (document.body.innerText || "") : "";
+    if (/请完成验证|安全验证|拖动滑块|按住滑块/.test(body)) {
+      return document.querySelector("#captcha-login-box") || document.body;
+    }
+    return null;
+  };
+})();
+"""
+
+// 驱动网页登录页填手机号再点「获取验证码」。页面纯前端渲染、类名会变，
+// 所以全部按「可见元素 + 文案」模糊匹配并重试；对不上就回报 fail。
+private const val DRIVER_JS = """
+(function () {
+  var PHONE = "__PHONE__";
+  var report = window.__melodiaReport;
+  var byText = window.__melodiaByText;
+  var visible = window.__melodiaVisible;
   function inputs() {
     var list = [];
     var all = document.querySelectorAll("input");
@@ -76,26 +98,13 @@ private const val DRIVER_JS = """
   }
   function setValue(el, v) {
     try {
-      var proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-      var desc = Object.getOwnPropertyDescriptor(proto, "value");
+      var desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
       if (desc && desc.set) desc.set.call(el, v); else el.value = v;
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       el.blur();
       return true;
     } catch (e) { return false; }
-  }
-  function hasCaptcha() {
-    var sels = ["iframe[src*='verify']", "iframe[src*='encrypt-pages']", "iframe[src*='captcha']",
-                "[class*='yidun']", "#captcha", "[id*='captcha']", "#captcha-login-box"];
-    for (var i = 0; i < sels.length; i++) {
-      try {
-        var el = document.querySelector(sels[i]);
-        if (el && visible(el)) return true;
-      } catch (e) {}
-    }
-    // 网易把风控验证做成浮层，文案固定为「请完成验证操作」
-    return /请完成验证|安全验证|拖动滑块|按住滑块/.test(document.body ? document.body.innerText || "" : "");
   }
   function findPhone() {
     var list = inputs();
@@ -106,42 +115,14 @@ private const val DRIVER_JS = """
     }
     return list.length > 0 ? list[0] : null;
   }
-  function findCode(phoneEl) {
-    var list = inputs();
-    for (var i = 0; i < list.length; i++) {
-      var el = list[i];
-      if (el === phoneEl) continue;
-      var hint = (el.placeholder || "") + (el.name || "") + (el.id || "") + (el.className || "");
-      if (/验证码|code|captcha|sms/i.test(hint)) return el;
-    }
-    return list.length > 1 ? list[1] : null;
-  }
   var tries = 0;
-  var resultChecks = 0;
   function retry() {
     tries++;
     if (tries > 40) { report("fail", "没能在网页登录页找到手机号输入框"); return; }
     setTimeout(walk, 500);
   }
-  function waitSendResult() {
-    resultChecks++;
-    if (hasCaptcha()) { report("captcha", "需要人机验证"); return; }
-    var doneBtn = byText(/(重新获取|重发|已发送|\d+\s*[sS]\s*后)/);
-    if (doneBtn) { report("sent", textOf(doneBtn)); return; }
-    var errBtn = byText(/(发送失败|操作频繁|请稍后|错误)/);
-    if (errBtn) { report("fail", textOf(errBtn)); return; }
-    if (resultChecks > 16) { report("unknown", "没等到页面反馈"); return; }
-    setTimeout(waitSendResult, 500);
-  }
-  function waitLoginResult() {
-    resultChecks++;
-    if (hasCaptcha()) { report("captcha", "需要人机验证"); return; }
-    var errBtn = byText(/(验证码错误|登录失败|密码错误|账号异常)/);
-    if (errBtn) { report("fail", textOf(errBtn)); return; }
-    if (resultChecks > 10) { report("submitted", ""); return; }
-    setTimeout(waitLoginResult, 500);
-  }
   function walk() {
+    if (window.__melodiaHasVerify()) { report("captcha", ""); return; }
     var phoneEl = findPhone();
     if (!phoneEl) {
       var method = byText(/(手机号登录|短信验证码登录|验证码登录|手机登录)/);
@@ -150,40 +131,113 @@ private const val DRIVER_JS = """
       return;
     }
     if (phoneEl.value !== PHONE) setValue(phoneEl, PHONE);
-    if (STEP === "send") {
-      var sendBtn = byText(/(获取验证码|发送验证码|点击获取|重新获取)/);
-      if (!sendBtn) { retry(); return; }
-      sendBtn.click();
-      report("progress", "点击获取验证码");
-      resultChecks = 0;
-      setTimeout(waitSendResult, 1200);
+    var sendBtn = byText(/(获取验证码|发送验证码|点击获取|重新获取)/);
+    if (!sendBtn) { retry(); return; }
+    sendBtn.click();
+    report("progress", "已点击获取验证码");
+  }
+  setTimeout(walk, 300);
+})();
+"""
+
+// 点完之后的观察器：只读页面状态不再点击（重复点击会把验证弹窗重新触发），
+// 验证期间顺手把验证框滚进视野，避免用户一进来看到的是空白登录页
+private const val WATCHER_JS = """
+(function () {
+  var report = window.__melodiaReport;
+  var byText = window.__melodiaByText;
+  var sawVerify = false;
+  var checks = 0;
+  function tick() {
+    checks++;
+    var verify = window.__melodiaHasVerify();
+    if (verify) {
+      sawVerify = true;
+      try { if (verify.scrollIntoView) verify.scrollIntoView({ block: "center" }); } catch (e) {}
+      if (checks < 240) setTimeout(tick, 500);
       return;
     }
-    var codeEl = findCode(phoneEl);
-    if (!codeEl) { retry(); return; }
+    if (sawVerify) { report("verifygone", ""); return; }
+    var sent = byText(/(重新获取|重发|已发送|\d+\s*[sS]\s*后)/);
+    if (sent) { report("sent", (sent.innerText || "").trim()); return; }
+    var err = byText(/(发送失败|操作频繁|请稍后|验证失败)/);
+    if (err) { report("fail", (err.innerText || "").trim()); return; }
+    // 发码流程里验证通过后页面会自己发，继续等；别的流程由 Kotlin 侧超时兜底
+    if (checks < 240) setTimeout(tick, 500);
+  }
+  setTimeout(tick, 1200);
+})();
+"""
+
+// 登录流程：填手机号 + 验证码再点登录按钮；滑块验证通过后会重新注入一次
+private const val LOGIN_JS = """
+(function () {
+  var PHONE = "__PHONE__";
+  var CODE = "__CODE__";
+  var report = window.__melodiaReport;
+  var byText = window.__melodiaByText;
+  var visible = window.__melodiaVisible;
+  function inputs() {
+    var list = [];
+    var all = document.querySelectorAll("input");
+    for (var i = 0; i < all.length; i++) if (visible(all[i])) list.push(all[i]);
+    return list;
+  }
+  function setValue(el, v) {
+    try {
+      var desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+      if (desc && desc.set) desc.set.call(el, v); else el.value = v;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.blur();
+      return true;
+    } catch (e) { return false; }
+  }
+  var tries = 0;
+  function retry() {
+    tries++;
+    if (tries > 30) { report("fail", "没能在网页登录页填写验证码"); return; }
+    setTimeout(walk, 500);
+  }
+  function walk() {
+    if (window.__melodiaHasVerify()) { report("captcha", ""); return; }
+    var list = inputs();
+    if (list.length < 2) {
+      var method = byText(/(手机号登录|短信验证码登录|验证码登录|手机登录)/);
+      if (method) method.click();
+      retry();
+      return;
+    }
+    var phoneEl = list[0];
+    for (var i = 0; i < list.length; i++) {
+      var hint = (list[i].placeholder || "") + (list[i].name || "") + (list[i].id || "");
+      if (list[i].type === "tel" || /手机|电话|phone|tel|mobile/i.test(hint)) { phoneEl = list[i]; break; }
+    }
+    setValue(phoneEl, PHONE);
+    var codeEl = null;
+    for (var j = 0; j < list.length; j++) {
+      if (list[j] === phoneEl) continue;
+      var h2 = (list[j].placeholder || "") + (list[j].name || "") + (list[j].id || "");
+      if (/验证码|code|captcha|sms/i.test(h2)) { codeEl = list[j]; break; }
+    }
+    if (!codeEl) codeEl = list[1];
     setValue(codeEl, CODE);
-    var loginBtn = byText(/(立即登录|登录\/注册|登\s*录)/);
-    if (!loginBtn) { retry(); return; }
-    loginBtn.click();
-    report("progress", "点击登录");
-    resultChecks = 0;
-    setTimeout(waitLoginResult, 1200);
+    var btn = byText(/(立即登录|登录\/注册|登\s*录)/);
+    if (!btn) { retry(); return; }
+    btn.click();
+    report("progress", "正在提交登录");
+    report("submitted", "");
   }
   setTimeout(walk, 300);
 })();
 """
 
 /**
- * 注意：当前未接入界面使用，保留实现备用。
+ * 用 WebView 驱动网易云网页登录页发码，成功后从 Cookie 里取 MUSIC_U。
  *
- * 2026-10 实测：`api/sms/captcha/sent` 对任何号码都直接返回 -462「请完成验证操作」并给出
- * 易盾行为验证页（verifyType 40），隐藏页面里盲点按钮无法完成这一步，所以发码改为在
- * 可见的官方网页登录页里由用户完成（见 WebViewLoginScreen / WebLoginPrefill）。
- *
- * 用隐藏的 WebView 驱动网易云网页登录页完成「发码 / 登录」，成功后从 Cookie 里取 MUSIC_U。
- *
- * 页面放在一个全透明、不可触摸、移出屏幕的 Dialog 里：页面能正常渲染和执行 JS，
- * 但用户看到的、点到的仍然是我们自己的手机号登录界面。
+ * 平时窗口透明、移出屏幕、不可触摸，用户只看到我们自己的手机号登录界面；
+ * 一旦网易要求行为验证（接口 -462），页面会弹滑块，这时把窗口缩小居中、压暗背景、恢复触摸，
+ * 让用户就地拖一下滑块；验证完成后再缩回去，验证码由页面自己发出去。
  */
 class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
 
@@ -194,10 +248,16 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     private var webView: WebView? = null
     private var pageReady = false
     private var pageQueued: (() -> Unit)? = null
+    private var presented = false
 
     private var sendCallback: ((Result<Unit>) -> Unit)? = null
+    private var sendProgress: ((String) -> Unit)? = null
     private var loginCallback: ((Result<String>) -> Unit)? = null
     private var loginPolling = false
+    private var loginAttempts = 0
+    private var lastPhone = ""
+    private var lastCode = ""
+    private val timeouts = mutableListOf<Runnable>()
 
     private val loginPoller = object : Runnable {
         override fun run() {
@@ -214,7 +274,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     /** 没有 Activity 就拿不到窗口 token，Dialog 建不起来，调用方需要退回纯接口登录 */
     val available: Boolean = activity != null
 
-    override fun sendCode(phone: String, onResult: (Result<Unit>) -> Unit) {
+    override fun sendCode(phone: String, onProgress: (String) -> Unit, onResult: (Result<Unit>) -> Unit) {
         main.post {
             if (!ensurePage()) {
                 onResult(Result.failure(fail("网页登录组件初始化失败")))
@@ -222,10 +282,10 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             }
             settlePendingCallbacks()
             sendCallback = onResult
-            main.postDelayed({
-                failSend("网页登录页没有响应，请改用网页登录")
-            }, SEND_TIMEOUT_MS)
-            inject(DRIVER_JS.replace("__STEP__", "send").replace("__PHONE__", phone).replace("__CODE__", ""))
+            sendProgress = onProgress
+            onProgress("正在打开网易登录页…")
+            schedule(SEND_TIMEOUT_MS) { failSend("网页登录页没有响应，请改用网页登录") }
+            inject(DRIVER_JS.replace("__PHONE__", phone))
         }
     }
 
@@ -237,12 +297,14 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             }
             settlePendingCallbacks()
             loginCallback = onResult
-            main.postDelayed({
-                if (loginCallback != null) {
-                    failLogin("网页登录超时，请检查网络后重试，或改用「其他登录方式 → 网页登录」")
-                }
-            }, LOGIN_TIMEOUT_MS)
-            inject(DRIVER_JS.replace("__STEP__", "login").replace("__PHONE__", phone).replace("__CODE__", code))
+            lastPhone = phone
+            lastCode = code
+            loginAttempts = 1
+            schedule(LOGIN_TIMEOUT_MS) {
+                if (loginCallback != null) failLogin("网页登录超时，请重试或改用网页登录")
+            }
+            startCookiePolling()
+            inject(LOGIN_JS.replace("__PHONE__", phone).replace("__CODE__", code))
         }
     }
 
@@ -251,26 +313,35 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             loginPolling = false
             main.removeCallbacks(loginPoller)
             pageQueued = null
-            settlePendingCallbacks()
+            settlePendingCallbacks("已取消验证")
             runCatching { webView?.stopLoading() }
             runCatching { dialog?.dismiss() }
             runCatching { webView?.destroy() }
             dialog = null
             webView = null
             pageReady = false
+            presented = false
         }
     }
 
-    // ======================= 内部 =======================
+    // ======================= 窗口显隐 =======================
 
     private fun ensurePage(): Boolean {
         val act = activity ?: return false
         if (webView != null) return true
-        val wv = createWebView()
-        if (wv == null) return false
+        val wv = createWebView() ?: return false
         webView = wv
         val d = Dialog(act, android.R.style.Theme_Translucent_NoTitleBar)
         d.setContentView(wv, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        d.setCancelable(true)
+        // 窗口显出来时按返回键视为放弃验证
+        d.setOnCancelListener {
+            if (presented) {
+                hideWindow()
+                failSend("已取消验证，验证码没有发出")
+                failLogin("已取消验证")
+            }
+        }
         d.window?.let { w ->
             w.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
             w.addFlags(
@@ -284,20 +355,73 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             lp.width = metrics.widthPixels
             lp.height = metrics.heightPixels
             lp.gravity = Gravity.TOP or Gravity.START
-            // 双保险：窗口整块透明 + 移出屏幕，用户完全看不到，也不会抢触摸
+            // 双保险：整块透明 + 移出屏幕，用户看不到也不会抢触摸
             lp.x = metrics.widthPixels
             lp.y = metrics.heightPixels
             lp.alpha = 0f
             w.attributes = lp
         }
         runCatching { d.show() }.onFailure {
-            AppLogger.e(TAG, "隐藏的网页登录窗口创建失败", it)
+            AppLogger.e(TAG, "网页登录窗口创建失败", it)
             webView = null
             return false
         }
         dialog = d
         wv.loadUrl(NeteaseEndpoints.LOGIN_URL)
         return true
+    }
+
+    /** 缩小居中 + 压暗背景 + 恢复触摸，用户就地拖滑块 */
+    private fun showWindow() {
+        val w = dialog?.window ?: return
+        if (presented) return
+        presented = true
+        val metrics = context.resources.displayMetrics
+        val lp = w.attributes
+        lp.width = (metrics.widthPixels * 0.94f).toInt()
+        lp.height = (metrics.heightPixels * 0.74f).toInt()
+        lp.gravity = Gravity.CENTER
+        lp.x = 0
+        lp.y = 0
+        lp.alpha = 1f
+        w.attributes = lp
+        w.setDimAmount(0.55f)
+        w.clearFlags(
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        )
+        w.setBackgroundDrawable(
+            GradientDrawable().apply {
+                cornerRadius = 24f * metrics.density
+                setColor(Color.WHITE)
+            }
+        )
+        evaluate("(function(){var el=window.__melodiaHasVerify&&window.__melodiaHasVerify();if(el&&el.scrollIntoView){el.scrollIntoView({block:'center'});}})();")
+        sendProgress?.invoke("网易要求人机验证，请拖一下滑块")
+    }
+
+    /** 验证结束/取消后重新藏起来 */
+    private fun hideWindow() {
+        val w = dialog?.window ?: return
+        if (!presented) return
+        presented = false
+        val metrics = context.resources.displayMetrics
+        val lp = w.attributes
+        lp.width = metrics.widthPixels
+        lp.height = metrics.heightPixels
+        lp.gravity = Gravity.TOP or Gravity.START
+        lp.x = metrics.widthPixels
+        lp.y = metrics.heightPixels
+        lp.alpha = 0f
+        w.attributes = lp
+        w.setDimAmount(0f)
+        w.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        w.addFlags(
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        )
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -321,6 +445,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     pageReady = true
+                    evaluate(PRELUDE_JS)
                     pageQueued?.let { queued ->
                         pageQueued = null
                         main.postDelayed(queued, 600)
@@ -335,22 +460,30 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
 
     // 页面没加载完就先排队，避免把脚本注入到空白页
     private fun inject(script: String) {
-        val action: () -> Unit = {
-            runCatching { webView?.evaluateJavascript(script, null) }
-            Unit
-        }
         if (pageReady) {
-            main.postDelayed(action, 400)
+            main.postDelayed({ evaluate(script) }, 400)
         } else {
-            pageQueued = action
-            main.postDelayed({
+            pageQueued = { evaluate(script) }
+            schedule(PAGE_LOAD_TIMEOUT_MS) {
                 if (!pageReady) {
                     pageQueued = null
                     failSend("网页登录页加载超时，请改用网页登录")
                     failLogin("网页登录页加载超时，请改用网页登录")
                 }
-            }, PAGE_LOAD_TIMEOUT_MS)
+            }
         }
+    }
+
+    private fun evaluate(script: String) {
+        runCatching { webView?.evaluateJavascript(script, null) }
+    }
+
+    private fun schedule(delayMs: Long, action: () -> Unit) {
+        val runnable = Runnable {
+            if (timeouts.remove(runnable)) action()
+        }
+        timeouts.add(runnable)
+        main.postDelayed(runnable, delayMs)
     }
 
     private fun onReport(payload: String) {
@@ -359,17 +492,43 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
         val message = json.optString("message")
         AppLogger.d(TAG, "网页登录回报: type=$type, message=$message")
         when (type) {
-            "sent" -> if (sendCallback != null) finishSend(Result.success(Unit))
-            "unknown" -> if (sendCallback != null) finishSend(Result.success(Unit))
+            "progress" -> if (message.isNotBlank()) sendProgress?.invoke(message)
             "captcha" -> {
-                val text = "网易云要求人机验证，请在网页登录里完成（点下方「改用网页登录」）"
+                // 网易要求行为验证：把窗口亮出来让用户拖滑块，其它超时顺延
+                if (sendCallback != null || loginCallback != null) {
+                    showWindow()
+                    schedule(CAPTCHA_TIMEOUT_MS) {
+                        failSend("验证没有完成，验证码没有发出")
+                        failLogin("验证没有完成")
+                    }
+                    evaluate(WATCHER_JS)
+                } else {
+                    hideWindow()
+                }
+            }
+            "sent" -> {
+                hideWindow()
+                if (sendCallback != null) finishSend(Result.success(Unit))
+            }
+            "unknown" -> {
+                hideWindow()
+                if (sendCallback != null) finishSend(Result.success(Unit))
+            }
+            "fail" -> {
+                hideWindow()
+                val text = message.ifBlank { "网页登录页操作失败，请改用网页登录" }
                 failSend(text)
                 failLogin(text)
             }
-            "fail" -> {
-                val text = message.ifBlank { "网页登录页操作失败，请改用「其他登录方式 → 网页登录」" }
-                failSend(text)
-                failLogin(text)
+            "verifygone" -> {
+                // 用户拖完滑块：登录流程需要把手机号+验证码重新提交一次
+                if (loginCallback != null && loginAttempts < 3) {
+                    loginAttempts++
+                    hideWindow()
+                    inject(LOGIN_JS.replace("__PHONE__", lastPhone).replace("__CODE__", lastCode))
+                } else if (sendCallback == null) {
+                    hideWindow()
+                }
             }
             "submitted" -> startCookiePolling()
             else -> Unit
@@ -385,6 +544,8 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     private fun finishSend(result: Result<Unit>) {
         val cb = sendCallback ?: return
         sendCallback = null
+        sendProgress = null
+        hideWindow()
         cb(result)
     }
 
@@ -393,6 +554,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
         loginCallback = null
         loginPolling = false
         main.removeCallbacks(loginPoller)
+        hideWindow()
         CookieManager.getInstance().flush()
         cb(result)
     }
@@ -404,17 +566,21 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     private fun fail(text: String) = AppError.BizError(-1, text)
 
     // 上一轮没回调就再来一次时，先把旧的失败掉，保证每次调用都只回调一次
-    private fun settlePendingCallbacks() {
+    private fun settlePendingCallbacks(reason: String = "上一次操作已被新的请求替换") {
+        timeouts.forEach { main.removeCallbacks(it) }
+        timeouts.clear()
         sendCallback?.let { cb ->
             sendCallback = null
-            cb(Result.failure(fail("上一次操作已被新的请求替换")))
+            sendProgress = null
+            cb(Result.failure(fail(reason)))
         }
         loginCallback?.let { cb ->
             loginCallback = null
             loginPolling = false
             main.removeCallbacks(loginPoller)
-            cb(Result.failure(fail("上一次操作已被新的请求替换")))
+            cb(Result.failure(fail(reason)))
         }
+        hideWindow()
     }
 
     private inner class Bridge {

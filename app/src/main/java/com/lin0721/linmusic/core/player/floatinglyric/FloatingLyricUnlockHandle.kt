@@ -3,18 +3,14 @@ package com.lin0721.linmusic.core.player.floatinglyric
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Lock
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -23,8 +19,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
@@ -33,18 +32,20 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** 小锁直径：够手指按住，又不至于盖住歌词 */
-val UNLOCK_HANDLE_SIZE = 40.dp
+/** 隐形解锁热区边长：够手指按住，平时完全看不见 */
+val UNLOCK_HANDLE_SIZE = 44.dp
 
 /** 按住多久解锁 */
 const val UNLOCK_HOLD_MS = 3_000L
 
 /**
- * 锁定状态下叠在歌词右上角的小锁。
+ * 锁定状态下叠在歌词右上角的「隐形」解锁热区。
  *
  * 锁定后歌词窗口整体加了 FLAG_NOT_TOUCHABLE，点击/滑动全部穿透给下层 App，
- * 所以只能靠这个独立的小窗口接收「按住不动」：按住 3 秒（有进度环读秒）就解锁，
- * 手指一移动或提前松开就取消，不会打断用户正在进行的操作。
+ * 所以只能靠这一小块独立窗口接收「按住不动」：按住满 3 秒解锁。
+ *
+ * 平时完全不画东西（只留一个 10% 透明度的小点表示位置），只有按住时才画出进度环读秒，
+ * 手指移动或提前松开立即取消。
  */
 @Composable
 fun FloatingLyricUnlockHandle(onUnlock: () -> Unit) {
@@ -58,8 +59,8 @@ fun FloatingLyricUnlockHandle(onUnlock: () -> Unit) {
             return@LaunchedEffect
         }
         progress.snapTo(0f)
-        // 读秒以 delay 为准，进度环只是动画：不能用 withTimeoutOrNull 包住动画，
-        // 动画时长和超时都是 3000ms，谁先到不确定，超时先到就会「进度满了却没解锁」。
+        // 读秒以 delay 为准，进度环只是动画：不能用 withTimeoutOrNull 包住等长动画，
+        // 那样超时和动画结束同时到，经常出现「环满了却没解锁」
         val ring = launch { progress.animateTo(1f, tween(UNLOCK_HOLD_MS.toInt(), easing = LinearEasing)) }
         delay(UNLOCK_HOLD_MS)
         ring.cancel()
@@ -71,7 +72,6 @@ fun FloatingLyricUnlockHandle(onUnlock: () -> Unit) {
     Box(
         modifier = Modifier
             .size(UNLOCK_HANDLE_SIZE)
-            .background(Color.Black.copy(alpha = if (pressed) 0.55f else 0.3f), CircleShape)
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
@@ -90,19 +90,38 @@ fun FloatingLyricUnlockHandle(onUnlock: () -> Unit) {
             },
         contentAlignment = Alignment.Center
     ) {
-        CircularProgressIndicator(
-            progress = { progress.value },
-            modifier = Modifier.fillMaxSize().padding(1.dp),
-            color = Color.White,
-            trackColor = Color.White.copy(alpha = 0.22f),
-            strokeWidth = 2.5.dp,
-            strokeCap = StrokeCap.Round
-        )
-        Icon(
-            Icons.Rounded.Lock,
-            contentDescription = "按住 3 秒解锁悬浮歌词",
-            tint = Color.White,
-            modifier = Modifier.size(16.dp)
-        )
+        if (pressed) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val stroke = 2.5.dp.toPx()
+                val inset = stroke / 2 + 2.dp.toPx()
+                val arcSize = Size(size.width - inset * 2, size.height - inset * 2)
+                val topLeft = Offset(inset, inset)
+                drawArc(
+                    color = Color.White.copy(alpha = 0.25f),
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = stroke, cap = StrokeCap.Round)
+                )
+                drawArc(
+                    color = Color.White.copy(alpha = 0.9f),
+                    startAngle = -90f,
+                    sweepAngle = 360f * progress.value,
+                    useCenter = false,
+                    topLeft = topLeft,
+                    size = arcSize,
+                    style = Stroke(width = stroke, cap = StrokeCap.Round)
+                )
+            }
+        } else {
+            // 极淡的一个点，告诉他这里可以按，但基本看不出来
+            Box(
+                modifier = Modifier
+                    .size(4.dp)
+                    .background(Color.White.copy(alpha = 0.12f), CircleShape)
+            )
+        }
     }
 }
