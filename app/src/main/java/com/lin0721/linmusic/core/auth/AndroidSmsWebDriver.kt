@@ -144,24 +144,31 @@ private const val DRIVER_JS = """
 // 验证期间顺手把验证框滚进视野，避免用户一进来看到的是空白登录页
 private const val WATCHER_JS = """
 (function () {
+  // 重复注入只保留一个观察循环
+  if (window.__melodiaWatching) return;
+  window.__melodiaWatching = true;
   var report = window.__melodiaReport;
   var byText = window.__melodiaByText;
   var sawVerify = false;
   var checks = 0;
+  function done(type, message) {
+    window.__melodiaWatching = false;
+    report(type, message);
+  }
   function tick() {
     checks++;
     var verify = window.__melodiaHasVerify();
     if (verify) {
-      sawVerify = true;
+      if (!sawVerify) { sawVerify = true; report("captcha", ""); }
       try { if (verify.scrollIntoView) verify.scrollIntoView({ block: "center" }); } catch (e) {}
       if (checks < 240) setTimeout(tick, 500);
       return;
     }
-    if (sawVerify) { report("verifygone", ""); return; }
+    if (sawVerify) { done("verifygone", ""); return; }
     var sent = byText(/(重新获取|重发|已发送|\d+\s*[sS]\s*后)/);
-    if (sent) { report("sent", (sent.innerText || "").trim()); return; }
+    if (sent) { done("sent", (sent.innerText || "").trim()); return; }
     var err = byText(/(发送失败|操作频繁|请稍后|验证失败)/);
-    if (err) { report("fail", (err.innerText || "").trim()); return; }
+    if (err) { done("fail", (err.innerText || "").trim()); return; }
     // 发码流程里验证通过后页面会自己发，继续等；别的流程由 Kotlin 侧超时兜底
     if (checks < 240) setTimeout(tick, 500);
   }
@@ -478,6 +485,11 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
         runCatching { webView?.evaluateJavascript(script, null) }
     }
 
+    private fun cancelTimeouts() {
+        timeouts.forEach { main.removeCallbacks(it) }
+        timeouts.clear()
+    }
+
     private fun schedule(delayMs: Long, action: () -> Unit) {
         val runnable = Runnable {
             if (timeouts.remove(runnable)) action()
@@ -494,8 +506,9 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
         when (type) {
             "progress" -> if (message.isNotBlank()) sendProgress?.invoke(message)
             "captcha" -> {
-                // 网易要求行为验证：把窗口亮出来让用户拖滑块，其它超时顺延
+                // 网易要求行为验证：把窗口亮出来让用户拖滑块，之前的超时全部作废顺延
                 if (sendCallback != null || loginCallback != null) {
+                    cancelTimeouts()
                     showWindow()
                     schedule(CAPTCHA_TIMEOUT_MS) {
                         failSend("验证没有完成，验证码没有发出")
@@ -525,12 +538,20 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
                 if (loginCallback != null && loginAttempts < 3) {
                     loginAttempts++
                     hideWindow()
+                    cancelTimeouts()
+                    schedule(LOGIN_TIMEOUT_MS) {
+                        if (loginCallback != null) failLogin("网页登录超时，请重试或改用网页登录")
+                    }
                     inject(LOGIN_JS.replace("__PHONE__", lastPhone).replace("__CODE__", lastCode))
                 } else if (sendCallback == null) {
                     hideWindow()
                 }
             }
-            "submitted" -> startCookiePolling()
+            "submitted" -> {
+                // 提交后再盯一会儿：登录时也常被要求拖滑块
+                startCookiePolling()
+                evaluate(WATCHER_JS)
+            }
             else -> Unit
         }
     }
@@ -567,8 +588,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
 
     // 上一轮没回调就再来一次时，先把旧的失败掉，保证每次调用都只回调一次
     private fun settlePendingCallbacks(reason: String = "上一次操作已被新的请求替换") {
-        timeouts.forEach { main.removeCallbacks(it) }
-        timeouts.clear()
+        cancelTimeouts()
         sendCallback?.let { cb ->
             sendCallback = null
             sendProgress = null
