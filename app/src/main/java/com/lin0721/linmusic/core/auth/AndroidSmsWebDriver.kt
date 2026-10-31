@@ -262,6 +262,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     private var loginCallback: ((Result<String>) -> Unit)? = null
     private var loginPolling = false
     private var loginAttempts = 0
+    private var timeoutGeneration = 0
     private var lastPhone = ""
     private var lastCode = ""
     private val timeouts = mutableListOf<Runnable>()
@@ -486,13 +487,20 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
     }
 
     private fun cancelTimeouts() {
+        timeoutGeneration++
         timeouts.forEach { main.removeCallbacks(it) }
         timeouts.clear()
     }
 
+    // 每次 schedule 都带上当时的代号，cancelTimeouts() 一加代号，旧回调即便已经在消息队列里也会作废
     private fun schedule(delayMs: Long, action: () -> Unit) {
-        val runnable = Runnable {
-            if (timeouts.remove(runnable)) action()
+        val token = timeoutGeneration
+        val runnable = object : Runnable {
+            override fun run() {
+                if (token != timeoutGeneration) return
+                timeouts.remove(this)
+                action()
+            }
         }
         timeouts.add(runnable)
         main.postDelayed(runnable, delayMs)
