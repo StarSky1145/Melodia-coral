@@ -133,7 +133,7 @@ fun LyricsSettingsView(viewModel: SettingsViewModel) {
                         HorizontalDivider(color = ContentPrimary.copy(alpha = 0.08f))
                         SettingsSwitchRow(
                             title = "锁定悬浮歌词",
-                            subtitle = "锁定后不可拖动与点击，长按歌词 3 秒解锁（播放通知里也能解锁）",
+                            subtitle = "锁定后完全触摸穿透，长按右上角小锁 3 秒解锁（播放通知里也能解锁）",
                             checked = floatingLocked,
                             onCheckedChange = { viewModel.updateFloatingLyricLocked(it) }
                         )

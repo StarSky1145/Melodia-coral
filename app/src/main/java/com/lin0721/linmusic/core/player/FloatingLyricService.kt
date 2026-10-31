@@ -33,6 +33,8 @@ import com.lin0721.linmusic.core.player.floatinglyric.FloatingLyricFrames
 import com.lin0721.linmusic.core.player.floatinglyric.FloatingLyricOverlay
 import com.lin0721.linmusic.core.player.floatinglyric.FloatingLyricSession
 import com.lin0721.linmusic.core.player.floatinglyric.FloatingLyricStyle
+import com.lin0721.linmusic.core.player.floatinglyric.FloatingLyricUnlockHandle
+import com.lin0721.linmusic.core.player.floatinglyric.UNLOCK_HANDLE_SIZE
 import com.lin0721.linmusic.core.player.floatinglyric.LyricResize
 import com.lin0721.linmusic.core.player.floatinglyric.LyricResizeHandle
 import com.lin0721.linmusic.core.player.floatinglyric.LyricResizeLimits
@@ -72,6 +74,10 @@ class FloatingLyricService : Service() {
     private var windowManager: WindowManager? = null
     private var composeView: ComposeView? = null
     private var params: WindowManager.LayoutParams? = null
+    // 锁定后才出现的小锁窗口：歌词窗口此时整体不可触摸（点击滑动全穿透），
+    // 只有这块小区域能收到「按住不动」，用来读秒解锁
+    private var lockHandleView: ComposeView? = null
+    private var lockHandleParams: WindowManager.LayoutParams? = null
     private val viewOwner = OverlayViewOwner()
     private val previewFontSize = mutableStateOf<Int?>(null)
     private var resize: ActiveResize? = null
@@ -144,6 +150,8 @@ class FloatingLyricService : Service() {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
             setContent { OverlayContent() }
         }
+        // 副行歌词出现/消失会改变窗口高度，小锁要跟着贴住右上角
+        view.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> syncLockHandle() }
         try {
             wm.addView(view, layoutParams)
             composeView = view
@@ -197,11 +205,84 @@ class FloatingLyricService : Service() {
     private fun applyLocked(locked: Boolean) {
         val lp = params ?: return
         val view = composeView ?: return
-        // 锁定时仍保持可触摸：原先加 FLAG_NOT_TOUCHABLE 会把触摸整体穿透给下层 App，
-        // 悬浮窗再也收不到事件，"长按 3 秒解锁"就无从触发。
-        // 改为让手势层自己把拖动/单击/双击全部吃掉，只放行长按解锁（见 FloatingLyricOverlay）。
+        // 锁定时歌词窗口整体不可触摸：点击、滑动全部穿透给下层 App，不打断任何操作。
+        // 解锁不靠歌词本体，而是右上角那块独立的小锁窗口（长按 3 秒，见 FloatingLyricUnlockHandle）
+        lp.flags = if (locked) {
+            lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        }
         lp.alpha = if (locked) LOCKED_WINDOW_ALPHA else 1f
         updateLayout(view, lp)
+        if (locked) showLockHandle() else hideLockHandle()
+    }
+
+    private fun showLockHandle() {
+        val wm = windowManager ?: return
+        if (lockHandleView != null) return
+        val handleSizePx = (UNLOCK_HANDLE_SIZE.value * resources.displayMetrics.density).roundToInt()
+        val handleView = ComposeView(this).apply {
+            setViewTreeLifecycleOwner(viewOwner)
+            setViewTreeSavedStateRegistryOwner(viewOwner)
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+            setContent { FloatingLyricUnlockHandle(onUnlock = { saveLocked(false) }) }
+        }
+        val handleParams = WindowManager.LayoutParams(
+            handleSizePx,
+            handleSizePx,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE
+            },
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
+        lockHandleView = handleView
+        lockHandleParams = handleParams
+        try {
+            wm.addView(handleView, handleParams)
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "添加解锁小锁窗口失败", e)
+            lockHandleView = null
+            lockHandleParams = null
+            return
+        }
+        syncLockHandle()
+    }
+
+    private fun hideLockHandle() {
+        val view = lockHandleView ?: return
+        lockHandleView = null
+        lockHandleParams = null
+        try {
+            windowManager?.removeView(view)
+        } catch (e: IllegalArgumentException) {
+            AppLogger.w(TAG, "小锁窗口未挂载，跳过移除", e)
+        }
+    }
+
+    // 小锁固定贴在歌词窗口右上角内侧，歌词被拖动/缩放/换行时同步跟随
+    private fun syncLockHandle() {
+        val view = lockHandleView ?: return
+        val lp = lockHandleParams ?: return
+        val lyricLp = params ?: return
+        val lyricView = composeView ?: return
+        if (lyricView.height <= 0) return
+        val metrics = resources.displayMetrics
+        val size = lp.width
+        lp.x = (lyricLp.x + lyricLp.width - size).coerceIn(0, (metrics.widthPixels - size).coerceAtLeast(0))
+        lp.y = lyricLp.y.coerceIn(0, (metrics.heightPixels - size).coerceAtLeast(0))
+        try {
+            windowManager?.updateViewLayout(view, lp)
+        } catch (e: IllegalArgumentException) {
+            AppLogger.w(TAG, "小锁窗口已移除，忽略布局更新", e)
+        }
     }
 
     private fun moveBy(dx: Float, dy: Float) {
@@ -261,6 +342,7 @@ class FloatingLyricService : Service() {
         } catch (e: IllegalArgumentException) {
             AppLogger.w(TAG, "悬浮歌词窗口已移除，忽略布局更新", e)
         }
+        syncLockHandle()
     }
 
     private fun saveBounds() {
@@ -294,6 +376,7 @@ class FloatingLyricService : Service() {
     }
 
     override fun onDestroy() {
+        hideLockHandle()
         viewOwner.destroy()
         serviceScope.cancel()
         composeView?.let { view ->

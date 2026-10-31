@@ -1,7 +1,5 @@
 package com.lin0721.linmusic.core.player.floatinglyric
 
-import android.os.Handler
-import android.os.Looper
 import android.view.MotionEvent
 import android.view.ViewConfiguration
 import androidx.compose.animation.AnimatedVisibility
@@ -52,9 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInteropFilter
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -69,9 +65,6 @@ import kotlinx.coroutines.delay
 private const val TAG = "FloatingLyricOverlay"
 
 private const val CONTROLS_AUTO_HIDE_MS = 3_000L
-
-// 锁定后唯一的解锁方式：按住歌词满 3 秒
-private const val UNLOCK_HOLD_MS = 3_000L
 private const val SECONDARY_SCALE = 0.7f
 private const val LINE_HEIGHT_SCALE = 1.35f
 
@@ -149,10 +142,8 @@ fun FloatingLyricOverlay(
                 .background(Color.Black.copy(alpha = style.backgroundAlpha / 100f))
         ) {
             // 手势层与拖动柄是兄弟节点：命中拖动柄时手势层收不到事件，调宽不会顺带移动窗口
-            val haptics = LocalHapticFeedback.current
             Box(
                 Modifier.matchParentSize().dragAndTap(
-                    locked = locked,
                     onMoveBy = { dx, dy ->
                         touched()
                         actions.onMoveBy(dx, dy)
@@ -162,11 +153,7 @@ fun FloatingLyricOverlay(
                         controlsVisible = !controlsVisible
                         touched()
                     },
-                    onDoubleTap = actions.onToggleLock,
-                    onLongPressUnlock = {
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        actions.onToggleLock()
-                    }
+                    onDoubleTap = actions.onToggleLock
                 )
             )
             Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -239,7 +226,6 @@ private fun ResizeHandle(handle: LyricResizeHandle, actions: FloatingLyricAction
         modifier
             .then(if (corner) Modifier.size(28.dp) else Modifier.width(20.dp).fillMaxHeight())
             .dragAndTap(
-                locked = false,
                 onMoveBy = { dx, _ ->
                     touched()
                     actions.onResizeBy(handle, dx)
@@ -247,8 +233,7 @@ private fun ResizeHandle(handle: LyricResizeHandle, actions: FloatingLyricAction
                 onDragStart = { actions.onResizeStart(handle) },
                 onGestureEnd = actions.onGestureEnd,
                 onTap = touched,
-                onDoubleTap = {},
-                onLongPressUnlock = {}
+                onDoubleTap = {}
             ),
         contentAlignment = Alignment.Center
     ) {
@@ -302,13 +287,11 @@ private fun BarButton(icon: ImageVector, description: String, onClick: () -> Uni
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 private fun Modifier.dragAndTap(
-    locked: Boolean,
     onMoveBy: (Float, Float) -> Unit,
     onGestureEnd: () -> Unit,
+    onDragStart: () -> Unit = {},
     onTap: () -> Unit,
-    onDoubleTap: () -> Unit,
-    onLongPressUnlock: () -> Unit,
-    onDragStart: () -> Unit = {}
+    onDoubleTap: () -> Unit
 ): Modifier {
     val context = LocalContext.current
     val tracker = remember { DragTapTracker(ViewConfiguration.get(context).scaledTouchSlop.toFloat()) }
@@ -317,8 +300,6 @@ private fun Modifier.dragAndTap(
     tracker.onGestureEnd = onGestureEnd
     tracker.onTap = onTap
     tracker.onDoubleTap = onDoubleTap
-    tracker.onLongPressUnlock = onLongPressUnlock
-    tracker.locked = locked
     return pointerInteropFilter { event -> tracker.handle(event) }
 }
 
@@ -328,19 +309,6 @@ private class DragTapTracker(private val touchSlop: Float) {
     var onGestureEnd: () -> Unit = {}
     var onTap: () -> Unit = {}
     var onDoubleTap: () -> Unit = {}
-    var onLongPressUnlock: () -> Unit = {}
-
-    // 锁定时窗口仍在接收触摸（不做触摸穿透，否则长按解锁永远收不到事件），
-    // 所以这里必须把拖动/单击/双击都吃掉，只放行 3 秒长按解锁
-    var locked: Boolean = false
-
-    private val handler = Handler(Looper.getMainLooper())
-    private val unlockRunnable = Runnable {
-        if (holding && !dragging) {
-            holding = false
-            onLongPressUnlock()
-        }
-    }
 
     private var downX = 0f
     private var downY = 0f
@@ -348,7 +316,6 @@ private class DragTapTracker(private val touchSlop: Float) {
     private var lastY = 0f
     private var dragging = false
     private var lastTapUpTime = 0L
-    private var holding = false
 
     fun handle(event: MotionEvent): Boolean {
         when (event.actionMasked) {
@@ -358,21 +325,8 @@ private class DragTapTracker(private val touchSlop: Float) {
                 lastX = downX
                 lastY = downY
                 dragging = false
-                lastTapUpTime = 0L
-                if (locked) {
-                    holding = true
-                    handler.postDelayed(unlockRunnable, UNLOCK_HOLD_MS)
-                    return true
-                }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (locked) {
-                    // 锁定时手指一移动就作废这次长按，避免拖动屏幕时误解锁
-                    if (holding && (kotlin.math.abs(event.rawX - downX) > touchSlop || kotlin.math.abs(event.rawY - downY) > touchSlop)) {
-                        cancelHold()
-                    }
-                    return true
-                }
                 if (!dragging && (kotlin.math.abs(event.rawX - downX) > touchSlop || kotlin.math.abs(event.rawY - downY) > touchSlop)) {
                     dragging = true
                     onDragStart()
@@ -384,10 +338,6 @@ private class DragTapTracker(private val touchSlop: Float) {
                 lastY = event.rawY
             }
             MotionEvent.ACTION_UP -> {
-                if (locked) {
-                    cancelHold()
-                    return true
-                }
                 if (dragging) {
                     onGestureEnd()
                 } else if (event.eventTime - lastTapUpTime <= ViewConfiguration.getDoubleTapTimeout()) {
@@ -400,10 +350,6 @@ private class DragTapTracker(private val touchSlop: Float) {
                 dragging = false
             }
             MotionEvent.ACTION_CANCEL -> {
-                if (locked) {
-                    cancelHold()
-                    return true
-                }
                 if (dragging) onGestureEnd()
                 dragging = false
             }
@@ -411,10 +357,6 @@ private class DragTapTracker(private val touchSlop: Float) {
         return true
     }
 
-    private fun cancelHold() {
-        holding = false
-        handler.removeCallbacks(unlockRunnable)
-    }
 }
 
 private fun parseColor(hex: String, fallback: Color): Color {
