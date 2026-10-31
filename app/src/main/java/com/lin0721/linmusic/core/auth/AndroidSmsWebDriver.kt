@@ -25,9 +25,12 @@ import org.json.JSONObject
 
 private const val TAG = "SmsWebDriver"
 
-private const val PAGE_LOAD_TIMEOUT_MS = 20_000L
-private const val SEND_TIMEOUT_MS = 18_000L
-private const val LOGIN_TIMEOUT_MS = 25_000L
+// 登录页是纯前端 SPA（首屏 HTML 里没有任何 input），WebView 要下完几 MB 的 chunk 才能渲染出表单，
+// 超时给太紧就会「进度条卡住然后失败」，给太松又会让人干等，所以这里留 25s，
+// 真正兜底的是 LoginViewModel 里的看门狗
+private const val PAGE_LOAD_TIMEOUT_MS = 25_000L
+private const val SEND_TIMEOUT_MS = 25_000L
+private const val LOGIN_TIMEOUT_MS = 30_000L
 private const val COOKIE_POLL_MS = 800L
 private const val HOST_URL = "https://${NeteaseEndpoints.WEB_HOST}"
 
@@ -83,14 +86,16 @@ private const val DRIVER_JS = """
     } catch (e) { return false; }
   }
   function hasCaptcha() {
-    var sels = ["iframe[src*='verify']", "iframe[src*='captcha']", "[class*='yidun']", "#captcha", "[id*='captcha']"];
+    var sels = ["iframe[src*='verify']", "iframe[src*='encrypt-pages']", "iframe[src*='captcha']",
+                "[class*='yidun']", "#captcha", "[id*='captcha']", "#captcha-login-box"];
     for (var i = 0; i < sels.length; i++) {
       try {
         var el = document.querySelector(sels[i]);
         if (el && visible(el)) return true;
       } catch (e) {}
     }
-    return false;
+    // 网易把风控验证做成浮层，文案固定为「请完成验证操作」
+    return /请完成验证|安全验证|拖动滑块|按住滑块/.test(document.body ? document.body.innerText || "" : "");
   }
   function findPhone() {
     var list = inputs();
@@ -169,6 +174,12 @@ private const val DRIVER_JS = """
 """
 
 /**
+ * 注意：当前未接入界面使用，保留实现备用。
+ *
+ * 2026-10 实测：`api/sms/captcha/sent` 对任何号码都直接返回 -462「请完成验证操作」并给出
+ * 易盾行为验证页（verifyType 40），隐藏页面里盲点按钮无法完成这一步，所以发码改为在
+ * 可见的官方网页登录页里由用户完成（见 WebViewLoginScreen / WebLoginPrefill）。
+ *
  * 用隐藏的 WebView 驱动网易云网页登录页完成「发码 / 登录」，成功后从 Cookie 里取 MUSIC_U。
  *
  * 页面放在一个全透明、不可触摸、移出屏幕的 Dialog 里：页面能正常渲染和执行 JS，
@@ -212,7 +223,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             settlePendingCallbacks()
             sendCallback = onResult
             main.postDelayed({
-                failSend("网页登录页一直没加载出来，请检查网络")
+                failSend("网页登录页没有响应，请改用网页登录")
             }, SEND_TIMEOUT_MS)
             inject(DRIVER_JS.replace("__STEP__", "send").replace("__PHONE__", phone).replace("__CODE__", ""))
         }
@@ -335,8 +346,8 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             main.postDelayed({
                 if (!pageReady) {
                     pageQueued = null
-                    failSend("网页登录页加载超时，请检查网络")
-                    failLogin("网页登录页加载超时，请检查网络")
+                    failSend("网页登录页加载超时，请改用网页登录")
+                    failLogin("网页登录页加载超时，请改用网页登录")
                 }
             }, PAGE_LOAD_TIMEOUT_MS)
         }
@@ -351,7 +362,7 @@ class AndroidSmsWebDriver(private val context: Context) : SmsWebDriver {
             "sent" -> if (sendCallback != null) finishSend(Result.success(Unit))
             "unknown" -> if (sendCallback != null) finishSend(Result.success(Unit))
             "captcha" -> {
-                val text = "网易云要求人机验证，请点「其他登录方式 → 网页登录」手动完成"
+                val text = "网易云要求人机验证，请在网页登录里完成（点下方「改用网页登录」）"
                 failSend(text)
                 failLogin(text)
             }

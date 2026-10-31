@@ -30,7 +30,8 @@ import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** 小锁直径：够手指按住，又不至于盖住歌词 */
 val UNLOCK_HANDLE_SIZE = 40.dp
@@ -56,14 +57,15 @@ fun FloatingLyricUnlockHandle(onUnlock: () -> Unit) {
             progress.animateTo(0f, tween(120))
             return@LaunchedEffect
         }
-        val finished = withTimeoutOrNull(UNLOCK_HOLD_MS) {
-            progress.animateTo(1f, tween(UNLOCK_HOLD_MS.toInt(), easing = LinearEasing))
-            true
-        } ?: false
-        if (finished) {
-            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-            onUnlock()
-        }
+        progress.snapTo(0f)
+        // 读秒以 delay 为准，进度环只是动画：不能用 withTimeoutOrNull 包住动画，
+        // 动画时长和超时都是 3000ms，谁先到不确定，超时先到就会「进度满了却没解锁」。
+        val ring = launch { progress.animateTo(1f, tween(UNLOCK_HOLD_MS.toInt(), easing = LinearEasing)) }
+        delay(UNLOCK_HOLD_MS)
+        ring.cancel()
+        progress.snapTo(1f)
+        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+        onUnlock()
     }
 
     Box(

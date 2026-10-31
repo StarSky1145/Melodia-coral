@@ -38,7 +38,6 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -48,11 +47,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.zxing.common.BitMatrix
-import com.lin0721.linmusic.core.auth.AndroidSmsWebDriver
 import com.lin0721.linmusic.core.auth.LoginViewModel
 import com.lin0721.linmusic.core.auth.QrLoginState
 import com.lin0721.linmusic.core.auth.SmsLoginState
-import com.lin0721.linmusic.core.auth.SmsWebDriver
 import com.lin0721.linmusic.core.ui.theme.BottomSheetShape
 import com.lin0721.linmusic.core.ui.theme.ContentSwitchDurationMs
 import com.lin0721.linmusic.core.ui.theme.LocalUiMotion
@@ -99,18 +96,9 @@ fun LoginBottomSheet(
     val viewModel: LoginViewModel = koinViewModel()
     var mode by remember { mutableStateOf(LoginMode.PHONE) }
 
-    // 手机号登录改由隐藏的网页登录页真实发起（纯接口请求容易被风控拦掉）。
-    // 驱动跟着弹窗生命周期存活：发码和登录必须是同一个页面会话，所以不能中途释放
-    val context = LocalContext.current
-    val smsDriver = remember { AndroidSmsWebDriver(context) }
-    val smsWebDriver: SmsWebDriver? = remember(smsDriver) { if (smsDriver.available) smsDriver else null }
-
     // 弹窗整体离开组合时兜底停止轮询，覆盖点击遮罩/手势关闭等未经返回按钮的路径
     DisposableEffect(Unit) {
-        onDispose {
-            viewModel.resetQrState()
-            smsDriver.release()
-        }
+        onDispose { viewModel.resetQrState() }
     }
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -179,9 +167,9 @@ fun LoginBottomSheet(
                     when (targetMode) {
                         LoginMode.PHONE -> PhoneLoginContent(
                             viewModel = viewModel,
-                            webDriver = smsWebDriver,
                             onLoginSuccess = onLoginSuccess,
-                            onOtherMethods = { mode = LoginMode.CHOICE }
+                            onOtherMethods = { mode = LoginMode.CHOICE },
+                            onWebLogin = onWebLogin
                         )
                         LoginMode.CHOICE -> LoginChoiceContent(
                             onWebLogin = onWebLogin,
@@ -208,9 +196,9 @@ fun LoginBottomSheet(
 @Composable
 private fun PhoneLoginContent(
     viewModel: LoginViewModel,
-    webDriver: SmsWebDriver?,
     onLoginSuccess: (String) -> Unit,
-    onOtherMethods: () -> Unit
+    onOtherMethods: () -> Unit,
+    onWebLogin: () -> Unit
 ) {
     val state by viewModel.smsState.collectAsStateWithLifecycle()
     var phone by rememberSaveable { mutableStateOf("") }
@@ -263,7 +251,20 @@ private fun PhoneLoginContent(
             imeAction = ImeAction.Done,
             letterSpacing = true,
             trailing = {
-                ResendButton(state = state, onClick = { viewModel.sendSmsCode(phone, webDriver = webDriver) })
+                ResendButton(
+                    state = state,
+                    onClick = {
+                        // 网易发码接口现在强制行为验证（返回 -462 请完成验证操作），
+                        // 隐藏页面自动点按钮也会被弹验证挡住，所以这一步必须交给用户在官方页面完成
+                        val normalized = phone.trim()
+                        if (!normalized.matches(Regex("^1\\d{10}$"))) {
+                            viewModel.showSmsError("请输入正确的手机号")
+                        } else {
+                            WebLoginPrefill.phone = normalized
+                            onWebLogin()
+                        }
+                    }
+                )
             }
         )
 
@@ -275,12 +276,21 @@ private fun PhoneLoginContent(
         Text(
             text = hint.orEmpty(),
             fontSize = 12.sp,
-            color = if (state.error != null) MaterialTheme.colorScheme.error else TextGray,
+            color = when {
+                state.error != null -> MaterialTheme.colorScheme.error
+                else -> TextGray
+            },
             modifier = Modifier.padding(top = MelodiaSpacing.sm).heightIn(min = 18.dp)
         )
+        // 网易发码必须过人机验证，本地发不出去时直接把用户送去官方页面
+        if (state.error != null) {
+            MelodiaTextButton(onClick = onWebLogin) {
+                Text("改用网页登录", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = NeteaseRed)
+            }
+        }
 
         MelodiaButton(
-            onClick = { viewModel.loginWithSms(phone, code, onLoginSuccess, webDriver = webDriver) },
+            onClick = { viewModel.loginWithSms(phone, code, onLoginSuccess) },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = MelodiaSpacing.md)
@@ -302,7 +312,7 @@ private fun PhoneLoginContent(
             Text("其他登录方式", fontSize = 14.sp, color = TextGray)
         }
         Text(
-            text = "验证码由网易云音乐发送，登录凭据只保存在本机",
+            text = "验证码只能由网易云官方页面发送（接口要求人机验证），点「获取验证码」会打开官方页面",
             fontSize = 11.sp,
             color = TextGray.copy(alpha = 0.8f),
             textAlign = TextAlign.Center,

@@ -28,6 +28,14 @@ private const val MAX_CONSECUTIVE_POLL_FAILURES = 5
 // 验证码重发间隔，与网易云客户端一致
 private const val SMS_RESEND_SECONDS = 60
 private const val SMS_CODE_LENGTH = 4
+// 网页登录驱动兜底超时：驱动自己的超时（发码 25s / 登录 30s）之外再加一层，
+// 保证「发送中…」不会无限转圈（驱动可能因为页面卡死、WebView 崩溃而一个回调都不给）
+private const val WEB_SEND_WATCHDOG_MS = 32_000L
+private const val WEB_LOGIN_WATCHDOG_MS = 40_000L
+private const val WEB_SEND_TIMEOUT_HINT =
+    "网易网页登录页没有响应，多半是要求人机验证。请点下方「改用网页登录」在官方页面完成登录"
+private const val WEB_LOGIN_TIMEOUT_HINT =
+    "网页登录没有完成，请点下方「改用网页登录」重新登录"
 // 中国大陆手机号：1 开头 11 位
 private val MAINLAND_PHONE = Regex("^1\\d{10}$")
 // 网易云要求人机验证时，验证码与扫码都会被拦，只能在网易云官方网页里完成验证后登录
@@ -182,8 +190,11 @@ class LoginViewModel(
         }
         _smsState.update { it.copy(sending = true, error = null) }
         if (webDriver != null) {
+            var finished = false
             // 回调约定在主线程，直接改状态即可
             webDriver.sendCode(normalized) { result ->
+                if (finished) return@sendCode
+                finished = true
                 if (result.isSuccess) {
                     _smsState.update { it.copy(sending = false, sentTo = normalized) }
                     startCountdown()
@@ -191,6 +202,14 @@ class LoginViewModel(
                     _smsState.update {
                         it.copy(sending = false, error = smsErrorText(result.exceptionOrNull(), "验证码发送失败，请稍后重试"))
                     }
+                }
+            }
+            // 驱动一个回调都不给时兜底，避免按钮永远停在「发送中…」
+            viewModelScope.launch {
+                delay(WEB_SEND_WATCHDOG_MS)
+                if (!finished) {
+                    finished = true
+                    _smsState.update { it.copy(sending = false, error = WEB_SEND_TIMEOUT_HINT) }
                 }
             }
             return
@@ -231,7 +250,10 @@ class LoginViewModel(
         }
         _smsState.update { it.copy(loggingIn = true, error = null) }
         if (webDriver != null) {
+            var finished = false
             webDriver.login(normalized, trimmedCode) { result ->
+                if (finished) return@login
+                finished = true
                 val cookies = result.getOrNull()
                 if (!cookies.isNullOrEmpty()) {
                     _smsState.update { it.copy(loggingIn = false) }
@@ -240,6 +262,13 @@ class LoginViewModel(
                     _smsState.update {
                         it.copy(loggingIn = false, error = smsErrorText(result.exceptionOrNull(), "登录失败，请重试"))
                     }
+                }
+            }
+            viewModelScope.launch {
+                delay(WEB_LOGIN_WATCHDOG_MS)
+                if (!finished) {
+                    finished = true
+                    _smsState.update { it.copy(loggingIn = false, error = WEB_LOGIN_TIMEOUT_HINT) }
                 }
             }
             return
@@ -256,6 +285,11 @@ class LoginViewModel(
                 }
             }
         }
+    }
+
+    // 界面侧的本地校验提示（手机号格式等），与接口错误共用同一个提示位
+    fun showSmsError(message: String) {
+        _smsState.update { it.copy(error = message) }
     }
 
     // 用户改动输入时清掉上一次的错误提示

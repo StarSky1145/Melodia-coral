@@ -53,6 +53,34 @@ private const val LOGIN_BUTTON_FIX_JS = """
 })();
 """
 
+// 手机号预填：网页登录页是 SPA，输入框要等 chunk 渲染出来，所以轮询填值
+private fun prefillScript(phone: String): String = """
+(function () {
+  var PHONE = "__PHONE__";
+  if (!PHONE || PHONE.length !== 11) return;
+  var tries = 0;
+  function fill() {
+    tries++;
+    var el = document.querySelector('input[type=tel]') ||
+             document.querySelector('input[placeholder*="手机"]') ||
+             document.querySelector('input[name*="phone"]');
+    if (el) {
+      if (el.value !== PHONE) {
+        try {
+          var d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+          if (d && d.set) d.set.call(el, PHONE); else el.value = PHONE;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        } catch (e) {}
+      }
+      return;
+    }
+    if (tries < 60) setTimeout(fill, 250);
+  }
+  fill();
+})();
+""".trimIndent().replace("__PHONE__", phone)
+
 /**
  * 网页授权登录界面
  */
@@ -62,9 +90,14 @@ private const val LOGIN_BUTTON_FIX_JS = """
 fun WebViewLoginScreen(
     onClose: () -> Unit,
     onLoginSuccess: (String) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // 从手机号登录跳过来时带着号码，进页面直接填好
+    prefillPhone: String? = null
 ) {
     BackHandler { onClose() }
+
+    // 只读一次交接值：Compose 重组会重复求值参数，直接当默认值会把号码取空
+    val phoneToFill = remember { prefillPhone ?: WebLoginPrefill.take() }
 
     var isLoading by remember { mutableStateOf(true) }
 
@@ -164,10 +197,13 @@ fun WebViewLoginScreen(
                                     checkCookies(onLoginSuccess)
                                     isLoading = false // 页面完全加载渲染完成后，关闭加载指示器
                                     view?.evaluateJavascript(LOGIN_BUTTON_FIX_JS, null)
+                                    phoneToFill?.let { phone -> view?.evaluateJavascript(prefillScript(phone), null) }
                                 }
 
                                 override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                                     checkCookies(onLoginSuccess)
+                                    // SPA 内部路由切换不会重新走 onPageFinished，补一次预填
+                                    phoneToFill?.let { phone -> view?.evaluateJavascript(prefillScript(phone), null) }
                                 }
 
                                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
