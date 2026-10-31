@@ -197,11 +197,9 @@ class FloatingLyricService : Service() {
     private fun applyLocked(locked: Boolean) {
         val lp = params ?: return
         val view = composeView ?: return
-        lp.flags = if (locked) {
-            lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        } else {
-            lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        }
+        // 锁定时仍保持可触摸：原先加 FLAG_NOT_TOUCHABLE 会把触摸整体穿透给下层 App，
+        // 悬浮窗再也收不到事件，"长按 3 秒解锁"就无从触发。
+        // 改为让手势层自己把拖动/单击/双击全部吃掉，只放行长按解锁（见 FloatingLyricOverlay）。
         lp.alpha = if (locked) LOCKED_WINDOW_ALPHA else 1f
         updateLayout(view, lp)
     }
