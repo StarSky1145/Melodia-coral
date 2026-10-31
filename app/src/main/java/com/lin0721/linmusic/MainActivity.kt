@@ -37,7 +37,6 @@ import com.lin0721.linmusic.core.ui.theme.MelodiaTheme
 import com.lin0721.linmusic.core.ui.theme.UiMotion
 import com.lin0721.linmusic.core.ui.theme.WATCH_UI_SCALE_PERCENT
 import com.lin0721.linmusic.core.ui.theme.isWatchSize
-import com.lin0721.linmusic.core.ui.theme.rememberMelodiaWatchMode
 import com.lin0721.linmusic.core.ui.theme.scaledBy
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
@@ -63,20 +62,23 @@ class MainActivity : ComponentActivity() {
     // 否则 100 的设定值和 80 的实际值会来回触发 recreate
     private var storedUiScalePercent = UiScale.DEFAULT_PERCENT
 
+    // 方屏手表标记：按缩放前的原始配置判定一次，界面层直接用这个结果。
+    // 缩放会把 screenWidthDp 除以 0.8，若在 Compose 里再判一次就会得到不一致的答案
+    private var watchMode = false
+
     // 本次创建时已应用的界面风格；偏好里的值与它不一致就重建界面
     private var appliedStyle = AppStyle.DEFAULT
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(newBase)
         // Activity 创建时 Koin 已由 Application 启动；读取失败按不缩放处理
+        watchMode = newBase.resources.configuration.isWatchSize()
         storedUiScalePercent = runCatching {
             runBlocking { GlobalContext.get().get<SettingsPreferences>().uiScalePercent.first() }
         }.getOrDefault(UiScale.DEFAULT_PERCENT)
         appliedUiScalePercent = storedUiScalePercent
         // 方屏手表：用户没动过缩放时套用 80%，手机排布才塞得进 200dp 见方
-        if (appliedUiScalePercent == UiScale.DEFAULT_PERCENT &&
-            newBase.resources.configuration.isWatchSize()
-        ) {
+        if (appliedUiScalePercent == UiScale.DEFAULT_PERCENT && watchMode) {
             appliedUiScalePercent = WATCH_UI_SCALE_PERCENT
         }
         val factor = UiScale.toFactor(appliedUiScalePercent)
@@ -140,7 +142,6 @@ class MainActivity : ComponentActivity() {
             val uiAnimationsEnabled by settingsPreferences.uiAnimationsEnabled.collectAsState(initial = true)
             val uiMotion = remember { UiMotion() }
             LaunchedEffect(uiAnimationsEnabled) { uiMotion.enabled = uiAnimationsEnabled }
-            val watchMode = rememberMelodiaWatchMode()
             CompositionLocalProvider(
                 LocalUiMotion provides uiMotion,
                 LocalMelodiaWatchMode provides watchMode
