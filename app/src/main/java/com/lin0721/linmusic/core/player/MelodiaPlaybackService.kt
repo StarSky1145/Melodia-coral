@@ -750,7 +750,15 @@ private fun isAudioOffloadSupported(context: Context): Boolean {
         .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
         .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
         .build()
-    return runCatching { audioManager.isOffloadedPlaybackSupported(format, attributes) }.getOrDefault(false)
+    // 该查询在编译用的 SDK 里没有符号，反射调用；查不到或调用失败时按「支持」处理，不改变原有行为
+    return runCatching {
+        val method = AudioManager::class.java.getMethod(
+            "isOffloadedPlaybackSupported",
+            AudioFormat::class.java,
+            android.media.AudioAttributes::class.java
+        )
+        method.invoke(audioManager, format, attributes) as? Boolean ?: true
+    }.getOrDefault(true)
 }
 
 
