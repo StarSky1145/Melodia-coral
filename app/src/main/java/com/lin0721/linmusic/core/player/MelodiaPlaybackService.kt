@@ -6,8 +6,10 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.media.AudioFormat
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
@@ -250,10 +252,15 @@ class MelodiaPlaybackService : MediaSessionService() {
                 sessionPlayer.setHandleAudioFocus(!playWithOtherApps)
             }
         }
-        // 设置页已保证两者互斥，这里再兜底一次，避免淡化时两台播放器争用卸载通道
+        // 设置页已保证两者互斥，这里再兜底一次，避免淡化时两台播放器争用卸载通道；
+        // 手表等设备的音频通路常常不支持直通，开启后会出现「时间在走但没声音」，这里按设备能力强制关掉
+        val offloadSupported = isAudioOffloadSupported(this)
+        if (!offloadSupported) {
+            AppLogger.i(TAG, "当前设备不支持音频直通，已强制关闭 offload")
+        }
         serviceScope.launch {
             combine(settingsPreferences.audioOffload, settingsPreferences.crossfadeEnabled) { offload, crossfade ->
-                offload && !crossfade
+                offload && !crossfade && offloadSupported
             }.distinctUntilChanged().collect { enabled ->
                 primaryPlayer.setAudioOffloadEnabled(enabled)
                 secondaryPlayer.setAudioOffloadEnabled(enabled)
@@ -726,6 +733,24 @@ private fun ExoPlayer.setAudioOffloadEnabled(enabled: Boolean) {
     trackSelectionParameters = trackSelectionParameters.buildUpon()
         .setAudioOffloadPreferences(AudioOffloadPreferences.Builder().setAudioOffloadMode(mode).build())
         .build()
+}
+
+// 音频直通（offload）需要芯片通路与 AudioService 同时支持，手表、多数定制 ROM 不支持。
+// 不支持却开启时，ExoPlayer 的卸载通道可能拿不到可用输出，表现为「进度在走、就是没声音」
+private fun isAudioOffloadSupported(context: Context): Boolean {
+    if (context.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)) return false
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+    val format = AudioFormat.Builder()
+        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+        .setSampleRate(48_000)
+        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+        .build()
+    val attributes = android.media.AudioAttributes.Builder()
+        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+        .build()
+    return runCatching { audioManager.isOffloadedPlaybackSupported(format, attributes) }.getOrDefault(false)
 }
 
 

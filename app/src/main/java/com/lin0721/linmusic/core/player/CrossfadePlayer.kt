@@ -144,6 +144,8 @@ class CrossfadePlayer(
             abandoned?.run {
                 stop()
                 clearMediaItems()
+                // 被顶替的缓冲方体积必须复位，否则它下次成为当前播放器时仍然是 0 音量
+                setVolume(1f)
             }
             releaseOutgoing()
             return super.handleSetMediaItems(mediaItems, startIndex, startPositionMs)
@@ -259,9 +261,17 @@ class CrossfadePlayer(
 
     // 中止淡化：停掉淡出方，当前播放器恢复满音量
     private fun releaseOutgoing() {
-        val hadOutgoing = outgoing != null
         stopOutgoing()
-        if (hadOutgoing) active.volume = 1f
+        forceFullVolume()
+    }
+
+    // 只要不是正在淡化，当前播放器就必须是满音量。
+    // 淡化中途被打断（暂停、切歌、焦点丢失）会把淡入方留在 0 音量上，之后继续播就完全没声音
+    private fun forceFullVolume() {
+        val exo = active
+        if (exo.volume == 1f) return
+        AppLogger.w(TAG, "当前播放器音量异常(${exo.volume})，强制恢复为 1f")
+        exo.volume = 1f
     }
 
     private fun stopOutgoing() {
@@ -303,6 +313,12 @@ class CrossfadePlayer(
             if (playWhenReady || active.playWhenReady) return
             completePendingImmediately(playWhenReady = false)
             releaseOutgoing()
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            // 真正开始出声时兜底校验音量：没有淡化在跑却停在 0 音量，就是被打断的淡入留下的哑巴状态
+            if (!isPlaying || pendingIncoming != null || outgoing != null) return
+            forceFullVolume()
         }
     }
 }

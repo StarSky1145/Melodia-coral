@@ -1,6 +1,7 @@
 package com.lin0721.linmusic.core.player
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Bundle
@@ -933,8 +934,15 @@ class PlayerManager(
         }
     }
 
+    // 手表只有一路很小的音频输出，交叉淡化时两台播放器交替抢输出，容易出「切歌後没声音」；
+    // 表上不启用淡化，走单播放器直切，牺牲效果换稳定出声
+    private val crossfadeUsable: Boolean by lazy {
+        !context.packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH)
+    }
+
     private fun canAutoCrossfade(): Boolean =
-        crossfadeEnabled && playbackQueue.playMode.value != PlayMode.SINGLE_LOOP && playbackQueue.size > 1
+        crossfadeEnabled && crossfadeUsable &&
+            playbackQueue.playMode.value != PlayMode.SINGLE_LOOP && playbackQueue.size > 1
 
     private suspend fun analyzeNextTrackStart(): Long? {
         val nextItem = playbackQueue.nextItemByMode() ?: return null
@@ -956,7 +964,7 @@ class PlayerManager(
         if (songId != null && uri != null) requestedSource = songId to uri
         val fadeMs = CrossfadePolicy.fadeMsFor(
             autoTransition = autoTransition,
-            enabled = crossfadeEnabled,
+            enabled = crossfadeEnabled && crossfadeUsable,
             isPlaying = _isPlaying.value,
             startPositionMs = startPosition,
             autoFadeMs = pendingAutoFadeMs

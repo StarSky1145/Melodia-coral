@@ -22,6 +22,7 @@ import com.lin0721.linmusic.core.preferences.SettingsPreferences
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -74,9 +75,11 @@ class SongDownloadWorker(
         // 已拿到下载名额开始下载；WorkManager 中处于 RUNNING 但未开始的任务仍在排队
         const val KEY_PROGRESS_STARTED = "progress_started"
 
-        // 断点续传的原始音频数据，按歌曲、音质与服务端文件大小区分，暂停或中断后保留
-        fun partialFile(context: Context, songId: Long, level: String, size: Long) =
-            File(context.cacheDir, "dl_${songId}_${level}_$size.part")
+        // 断点续传的原始音频数据，按歌曲与音质固定命名，暂停或中断后保留。
+        // 不能把服务端返回的文件大小拼进名字：同一首歌每次取链接拿到的 size 可能不同（转码节点/缓存差异），
+        // 一旦变化就会换成一个全新的空文件，已下载的字节全部作废，表现就是「下载完成后又从 0 开始」
+        fun partialFile(context: Context, songId: Long, level: String) =
+            File(context.cacheDir, "dl_${songId}_${level}.part")
 
         // 某首歌的全部断点文件，取消下载时清理
         fun partialFilesOf(context: Context, songId: Long): List<File> =
@@ -139,7 +142,10 @@ class SongDownloadWorker(
 
     private suspend fun download(songId: Long, existingRecord: DownloadRecord?): Result {
         if (batchTag != "stream_cache") {
-            setForegroundAsync(buildForegroundInfo(0))
+            // Android 12+ 后台启动前台服务可能被系统拒绝（ForegroundServiceStartNotAllowedException）。
+            // 通知只是展示用，抛出去会白白消耗一次重试，让用户看到「下载完成又从 0 开始」
+            runCatching { setForegroundAsync(buildForegroundInfo(0)) }
+                .onFailure { AppLogger.w(TAG, "进入前台失败，继续下载 songId=$songId", it) }
             publishProgress(0)
         }
 
@@ -169,10 +175,12 @@ class SongDownloadWorker(
             val displayName = "${sanitizeFileName("$artistName - $songName")}.$extension"
             val mimeType = mimeTypeFor(extension)
 
-            val partialFile = partialFile(applicationContext, songId, level, item.size)
+            val partialFile = partialFile(applicationContext, songId, level)
             partial = partialFile
             val downloadedSize = downloadToFile(partialFile, url, item.size)
             if (downloadedSize == null) {
+                // 断流/长度不符时保留已下载字节，下次重试从断点继续而不是整首重下
+                keepPartial = true
                 return fail("下载中断")
             }
 
@@ -206,6 +214,8 @@ class SongDownloadWorker(
                     }
                     cleanup = { doc.delete() }
                     if (copyFileToUri(tempFile, doc.uri)) {
+                        // 文件已写入成功，后续记录写入即使失败也不能再删掉用户已经拿到的文件
+                        cleanup = null
                         doc.uri
                     } else {
                         null
@@ -226,6 +236,8 @@ class SongDownloadWorker(
                     cleanup = { applicationContext.contentResolver.delete(uri, null, null) }
                     if (copyFileToUri(tempFile, uri)) {
                         finalizePendingMediaStoreEntry(uri)
+                        // 同上：文件已经落盘，记录写入失败时不要回滚删除
+                        cleanup = null
                         uri
                     } else {
                         null
@@ -238,8 +250,9 @@ class SongDownloadWorker(
                 return fail("下载中断")
             }
 
-            // 记录实际下发的音质档位
-            downloadPreferences.addRecord(
+            // 记录实际下发的音质档位；记录写失败只影响「是否显示已下载」，
+            // 不能因此让任务失败并回滚已落盘的文件（那正是「下完又从头下、本地不保留」的成因）
+            saveRecordWithRetry(
                 DownloadRecord(
                     songId = songId,
                     mediaStoreUri = finalUri.toString(),
@@ -263,11 +276,13 @@ class SongDownloadWorker(
         } catch (e: CancellationException) {
             // 暂停、取消或系统中断：清理目标文件，保留断点文件；用户取消时由管理器删除断点
             cleanup?.invoke()
+            if (restorePartial(localTemp, partial)) localTemp = null
             keepPartial = true
             throw e
         } catch (e: Exception) {
             AppLogger.e(TAG, "下载异常 songId=$songId", e)
             cleanup?.invoke()
+            if (restorePartial(localTemp, partial)) localTemp = null
             return if (runAttemptCount < MAX_ATTEMPTS) {
                 keepPartial = true
                 Result.retry()
@@ -558,7 +573,8 @@ class SongDownloadWorker(
                             if (progress != lastProgress) {
                                 lastProgress = progress
                                 if (batchTag == null) {
-                                    setForegroundAsync(buildForegroundInfo(progress))
+                                    // 进度刷新过于频繁时系统可能拒绝前台服务更新，忽略即可，不能中断下载
+                                    runCatching { setForegroundAsync(buildForegroundInfo(progress)) }
                                 }
                                 publishProgress(progress)
                             }
@@ -573,6 +589,27 @@ class SongDownloadWorker(
     // 解析 "bytes 100-199/200" 的起始偏移
     private fun contentRangeStart(header: String?): Long? =
         header?.removePrefix("bytes")?.trim()?.substringBefore('-')?.toLongOrNull()
+
+    // 记录写入失败重试一次：DataStore 偶发 IO 异常不该让整次下载前功尽弃
+    private suspend fun saveRecordWithRetry(record: DownloadRecord) {
+        repeat(2) { attempt ->
+            val result = runCatching { downloadPreferences.addRecord(record) }
+            if (result.isSuccess) return
+            AppLogger.w(TAG, "写入下载记录失败 attempt=${attempt + 1} songId=${record.songId}", result.exceptionOrNull())
+            if (attempt == 0) delay(200)
+        }
+    }
+
+    // 拷贝/写标签等后续步骤失败时，把已下完的临时文件还原成断点文件；
+    // 否则 finally 一删，WorkManager 重试就得从 0 重新下整首歌
+    private fun restorePartial(temp: File?, partialFile: File?): Boolean {
+        val source = temp ?: return false
+        val target = partialFile ?: return false
+        if (!source.exists() || target.exists()) return false
+        return runCatching { source.renameTo(target) || source.copyTo(target, overwrite = true).exists() }
+            .onFailure { AppLogger.w(TAG, "还原断点文件失败", it) }
+            .getOrDefault(false)
+    }
 
     // 拷贝文件至目标 Uri
     private suspend fun copyFileToUri(file: File, uri: Uri, mode: String = "w"): Boolean = withContext(Dispatchers.IO) {
