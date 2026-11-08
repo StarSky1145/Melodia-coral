@@ -55,6 +55,10 @@ class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    // Android 9 及以下下载要写进公共音乐目录，必须运行时授予存储权限
+    private val storagePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
     // 本次创建时已应用的缩放百分比；偏好里的值与它不一致就重建界面
     private var appliedUiScalePercent = UiScale.DEFAULT_PERCENT
 
@@ -111,6 +115,7 @@ class MainActivity : ComponentActivity() {
         }
         enableEdgeToEdge(statusBarStyle = barStyle, navigationBarStyle = barStyle)
         requestNotificationPermissionIfNeeded()
+        requestStoragePermissionIfNeeded()
         handleLaunchIntent(intent)
 
         // 监听悬浮歌词开关
@@ -193,6 +198,18 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
         if (!granted) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    // Android 9 及以下写公共音乐目录需要运行时存储权限，否则下载只能落到应用专属目录
+    private fun requestStoragePermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return
+        val needed = arrayOf(
+            Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        ).filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (needed.isNotEmpty()) {
+            storagePermissionLauncher.launch(needed.toTypedArray())
         }
     }
 

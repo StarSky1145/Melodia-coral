@@ -3,6 +3,7 @@ package com.lin0721.linmusic.core.download
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.pm.ServiceInfo
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -222,27 +223,10 @@ class SongDownloadWorker(
                     }
                 }
             } else {
-                val reusableUri = findReusableMediaStoreEntry(displayName)
-                if (reusableUri != null && markMediaStoreEntryPending(reusableUri)) {
-                    // 同名文件覆盖写入，避免 MediaStore 自动重命名出 "(1)" 副本
-                    val written = copyFileToUri(tempFile, reusableUri, mode = "wt")
-                    finalizePendingMediaStoreEntry(reusableUri)
-                    if (written) reusableUri else null
-                } else {
-                    val uri = insertPendingMediaStoreEntry(displayName, mimeType)
-                    if (uri == null) {
-                        return fail("创建本地文件失败", "MediaStore insert 失败")
-                    }
-                    cleanup = { applicationContext.contentResolver.delete(uri, null, null) }
-                    if (copyFileToUri(tempFile, uri)) {
-                        finalizePendingMediaStoreEntry(uri)
-                        // 同上：文件已经落盘，记录写入失败时不要回滚删除
-                        cleanup = null
-                        uri
-                    } else {
-                        null
-                    }
-                }
+                // Android 9 及以下的 MediaStore 没有 RELATIVE_PATH / IS_PENDING 列，
+                // 插入时 provider 取不到 _data 会抛 NullPointerException，
+                // 于是「下到 100% → 保存抛异常 → Result.retry 从 0 再来」无限循环
+                saveToDefaultDirectory(tempFile, displayName, mimeType, extension)
             }
 
             if (finalUri == null) {
@@ -459,6 +443,111 @@ class SongDownloadWorker(
         val values = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
         applicationContext.contentResolver.update(uri, values, null, null)
     }
+
+    // 保存到默认目录：Android 10+ 走 MediaStore（写公共音乐库），
+    // 更低版本或 MediaStore 出错时直写文件，保证下载成功的字节一定落盘
+    private suspend fun saveToDefaultDirectory(
+        tempFile: File,
+        displayName: String,
+        mimeType: String,
+        extension: String
+    ): Uri? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { saveToMediaStore(tempFile, displayName, mimeType) }
+                .onFailure { AppLogger.w(TAG, "MediaStore 保存失败，改用直写文件 songId=$songId", it) }
+                .getOrNull()
+                ?.let { return it }
+        }
+        return saveToFileDirectory(tempFile, displayName, extension)
+    }
+
+    // MediaStore 写入：同名条目覆盖写，避免系统自动重命名出 "(1)" 副本
+    private suspend fun saveToMediaStore(tempFile: File, displayName: String, mimeType: String): Uri? {
+        val reusableUri = findReusableMediaStoreEntry(displayName)
+        if (reusableUri != null && markMediaStoreEntryPending(reusableUri)) {
+            val written = copyFileToUri(tempFile, reusableUri, mode = "wt")
+            runCatching { finalizePendingMediaStoreEntry(reusableUri) }
+                .onFailure { AppLogger.w(TAG, "结束写入中状态失败 uri=$reusableUri", it) }
+            if (written) return reusableUri
+            runCatching { applicationContext.contentResolver.delete(reusableUri, null, null) }
+            return null
+        }
+        val uri = insertPendingMediaStoreEntry(displayName, mimeType) ?: return null
+        if (!copyFileToUri(tempFile, uri)) {
+            runCatching { applicationContext.contentResolver.delete(uri, null, null) }
+            return null
+        }
+        runCatching { finalizePendingMediaStoreEntry(uri) }
+            .onFailure { AppLogger.w(TAG, "结束写入中状态失败 uri=$uri", it) }
+        return uri
+    }
+
+    // 直写文件：有存储权限就写公共音乐目录，否则退回应用专属目录（不需要任何权限）
+    private suspend fun saveToFileDirectory(tempFile: File, displayName: String, extension: String): Uri? =
+        withContext(Dispatchers.IO) {
+            val folder = batchTag?.let { sanitizeFileName(batchLabel) }
+            val subDir = if (folder != null) "Melodia/$folder" else "Melodia"
+            val publicDir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC),
+                subDir
+            )
+            val usePublic = hasStorageWritePermission() &&
+                runCatching { publicDir.mkdirs() || publicDir.isDirectory }.getOrDefault(false) &&
+                publicDir.canWrite()
+            val directory = if (usePublic) {
+                publicDir
+            } else {
+                File(
+                    applicationContext.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
+                        ?: applicationContext.filesDir,
+                    subDir
+                ).also { runCatching { it.mkdirs() } }
+            }
+            val target = resolveTargetFile(directory, displayName)
+            val written = runCatching {
+                FileOutputStream(target, false).use { out -> tempFile.inputStream().use { it.copyTo(out) } }
+            }.onFailure { AppLogger.e(TAG, "写入文件失败 path=${target.absolutePath} songId=$songId", it) }
+                .isSuccess
+            if (!written) {
+                runCatching { target.delete() }
+                return@withContext null
+            }
+            if (usePublic) {
+                // 登记到系统媒体库，其他播放器/文件管理器里也能看到这首歌
+                runCatching {
+                    MediaScannerConnection.scanFile(
+                        applicationContext,
+                        arrayOf(target.absolutePath),
+                        arrayOf(mimeTypeFor(extension)),
+                        null
+                    )
+                }.onFailure { AppLogger.w(TAG, "登记媒体库失败 path=${target.absolutePath}", it) }
+            }
+            AppLogger.i(TAG, "已保存到 ${target.absolutePath} songId=$songId")
+            Uri.fromFile(target)
+        }
+
+    // 同名文件没被别的歌占用就复用（覆盖写），否则加时间戳避免顶掉另一首
+    private suspend fun resolveTargetFile(directory: File, displayName: String): File {
+        val existing = File(directory, displayName)
+        if (!existing.exists()) return existing
+        val claimedByOther =
+            downloadPreferences.isUriClaimedByOtherSong(Uri.fromFile(existing).toString(), songId)
+        if (!claimedByOther) return existing
+        val dot = displayName.lastIndexOf('.')
+        val name = if (dot > 0) {
+            "${displayName.substring(0, dot)}_${System.currentTimeMillis()}${displayName.substring(dot)}"
+        } else {
+            "${displayName}_${System.currentTimeMillis()}"
+        }
+        return File(directory, name)
+    }
+
+    // Android 9 及以下写公共音乐目录需要运行时存储权限；10+ 走 MediaStore 不需要
+    private fun hasStorageWritePermission(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ||
+            applicationContext.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     // 解析自定义存储目录
     private fun resolveCustomDirectory(customFolderUri: String): DocumentFile? {

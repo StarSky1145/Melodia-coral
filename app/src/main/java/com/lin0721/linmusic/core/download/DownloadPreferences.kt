@@ -12,6 +12,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.lin0721.linmusic.core.log.AppLogger
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -121,7 +122,10 @@ class DownloadPreferences(private val context: Context) {
         verifiedUris.remove(uriString)
         runCatching {
             val uri = Uri.parse(uriString)
-            if (isDefaultDownloadDirectoryUri(uriString)) {
+            if (uri.scheme == "file") {
+                // 低版本直写文件得到的记录，直接删物理文件
+                File(uri.path ?: return@runCatching false).delete()
+            } else if (isDefaultDownloadDirectoryUri(uriString)) {
                 context.contentResolver.delete(uri, null, null) > 0
             } else {
                 DocumentsContract.deleteDocument(context.contentResolver, uri)
